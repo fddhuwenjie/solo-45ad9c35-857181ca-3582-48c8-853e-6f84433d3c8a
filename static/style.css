@@ -1,0 +1,77 @@
+:root {
+  --bg: #1e2126; --panel: #262a31; --line: #3a4048;
+  --fg: #e6e8eb; --dim: #9aa3ad; --accent: #4f9cf9; --warn: #e6b93d; --err: #e5534b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 17px; margin: 0; }
+.hdr-group { display: flex; gap: 8px; align-items: center; }
+button, .btn, select {
+  background: #31363f; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px;
+  text-decoration: none; display: inline-block;
+}
+button:hover, .btn:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .4; cursor: default; }
+.badge { background: #31363f; border: 1px solid var(--line); border-radius: 10px; padding: 2px 10px; font-size: 12px; color: var(--dim); }
+
+#emptyState { padding: 60px; text-align: center; color: var(--dim); }
+main { display: flex; gap: 12px; padding: 12px; align-items: flex-start; }
+#stage { flex: 1 1 auto; min-width: 0; }
+#sidebar { flex: 0 0 380px; display: flex; flex-direction: column; gap: 12px; }
+
+nav { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+nav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+#hint {
+  min-height: 22px; color: var(--warn); font-size: 13px; margin: 4px 0;
+}
+#canvasWrap { background: #14161a; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+canvas { display: block; width: 100%; }
+#profileWrap { margin-top: 10px; background: #14161a; border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+#profileTitle { color: var(--dim); font-size: 12px; padding: 2px 4px; }
+#profileCv { height: 240px; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.panel h3 { margin: 0 0 8px; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+.row { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+.row.wrap { flex-wrap: wrap; }
+.kv { color: var(--dim); font-size: 12px; white-space: pre-line; }
+.warn { color: var(--warn); font-size: 12px; margin-top: 6px; }
+#geomSteps { margin: 6px 0; padding-left: 20px; color: var(--dim); }
+#geomSteps li.current { color: var(--accent); font-weight: 600; }
+#geomSteps li.done { color: #5c6; }
+input[type=number] { width: 80px; background: #14161a; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+input[type=text] { background: #14161a; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+
+.itemlist { list-style: none; margin: 6px 0 0; padding: 0; max-height: 260px; overflow: auto; }
+.itemlist li {
+  display: flex; gap: 8px; align-items: center; padding: 4px 6px;
+  border-bottom: 1px solid var(--line); font-size: 13px; cursor: pointer;
+}
+.itemlist li.selected { background: #2d3a4d; }
+.itemlist li .grow { flex: 1; }
+.itemlist li button { padding: 1px 8px; font-size: 12px; }
+
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { border: 1px solid var(--line); padding: 3px 6px; text-align: right; }
+th { background: #2b3038; color: var(--dim); font-weight: 500; }
+td.flagged { color: var(--warn); }
+
+.flag { border-left: 3px solid var(--warn); padding-left: 8px; }
+.flag.error { border-left-color: var(--err); }
+.flag .msg { font-size: 12px; }
+.flag .kept { color: #5c6; font-size: 12px; }
+.flag form { display: flex; gap: 4px; margin-top: 4px; }
+.flag input[type=text] { flex: 1; font-size: 12px; }
+
+dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; max-width: 720px; }
+dialog pre { background: #14161a; padding: 8px; border-radius: 6px; overflow: auto; font-size: 11px; max-height: 300px; }
+dialog::backdrop { background: rgba(0,0,0,.6); }

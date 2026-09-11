@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>TLC 定量打印记录 — {{ analysis.name }}</title>
+<style>
+  body { font: 13px/1.6 "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px; color: #111; }
+  h1 { font-size: 18px; } h2 { font-size: 15px; border-bottom: 1px solid #999; padding-bottom: 4px; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border: 1px solid #888; padding: 3px 8px; text-align: right; }
+  th { background: #eee; }
+  td.l { text-align: left; }
+  img.plate { max-width: 100%; border: 1px solid #888; }
+  .meta { color: #444; font-size: 12px; }
+  .flag-warn { color: #a06a00; } .flag-err { color: #b00; }
+  .noprint { margin: 12px 0; }
+  @media print { .noprint { display: none; } }
+</style>
+</head>
+<body>
+<div class="noprint"><button onclick="window.print()">打印</button></div>
+<h1>薄层色谱图像定量记录</h1>
+<p class="meta">
+  分析 #{{ analysis.id }} · {{ analysis.name }} · 几何版本 v{{ bundle.geometry_version }} ·
+  生成时间 {{ now }} · 工具 {{ bundle.tool }} {{ bundle.tool_version }}<br>
+  原图 {{ analysis.image_width }}×{{ analysis.image_height }} px ·
+  SHA-1 {{ analysis.image_sha1 }} · 校正图 {{ bundle.geometry.derived.width }}×{{ bundle.geometry.derived.height }} px
+</p>
+
+<h2>几何与算法参数(可复算)</h2>
+<table>
+  <tr><th class="l">参数</th><th class="l">值</th></tr>
+  <tr><td class="l">四角(原图 px)</td><td class="l">{{ bundle.geometry.params.corners }}</td></tr>
+  <tr><td class="l">基线点 / 前沿点(原图 px)</td>
+      <td class="l">{{ bundle.geometry.params.baseline }} / {{ bundle.geometry.params.front }}</td></tr>
+  <tr><td class="l">标尺</td>
+      <td class="l">{{ bundle.geometry.params.scale.p1 }} ↔ {{ bundle.geometry.params.scale.p2 }} = {{ bundle.geometry.params.scale.mm }} mm
+          ({{ "%.2f"|format(bundle.geometry.derived.px_per_mm) }} px/mm)</td></tr>
+  <tr><td class="l">基线 y / 前沿 y(校正图)</td>
+      <td class="l">{{ "%.1f"|format(bundle.geometry.derived.baseline_y) }} / {{ "%.1f"|format(bundle.geometry.derived.front_y) }}</td></tr>
+  <tr><td class="l">背景估计</td><td class="l">{{ bundle.background }}</td></tr>
+  <tr><td class="l">峰检测</td><td class="l">{{ bundle.detection }}</td></tr>
+  <tr><td class="l">异常阈值</td><td class="l">{{ bundle.qc }}</td></tr>
+</table>
+
+<h2>校正标注图</h2>
+<img class="plate" src="{{ url_for('export_annotated', aid=analysis.id) }}" alt="annotated">
+
+<h2>逐斑点结果</h2>
+<table>
+  <tr><th>泳道</th><th>#</th><th>Rf</th><th>中心 y (px)</th><th>距基线 (mm)</th>
+      <th>面积</th><th>峰高</th><th>泳道 %</th><th>全板 %</th><th>饱和像素</th></tr>
+  {% for s in result.spots|sort(attribute='lane_id') %}
+  <tr>
+    <td>{{ lane_label.get(s.lane_id) or "L%d"|format(s.lane_id) }}</td>
+    <td>{{ s.spot_no }}</td>
+    <td>{{ "%.4f"|format(s.rf) }}</td>
+    <td>{{ "%.1f"|format(s.center_y) }}</td>
+    <td>{{ "—" if s.center_mm is none else "%.2f"|format(s.center_mm) }}</td>
+    <td>{{ "%.0f"|format(s.area) }}</td>
+    <td>{{ "%.1f"|format(s.height) }}</td>
+    <td>{{ "%.1f"|format(s.pct_lane) }}</td>
+    <td>{{ "%.1f"|format(s.pct_plate) }}</td>
+    <td>{{ s.saturated_px }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="meta">全板总面积 {{ "%.0f"|format(result.totals.plate) }}</p>
+
+<h2>异常与处置</h2>
+{% if result.flags %}
+<table>
+  <tr><th class="l">级别</th><th class="l">类型</th><th class="l">说明</th><th class="l">处置</th></tr>
+  {% for f in result.flags %}
+  <tr>
+    <td class="l {{ 'flag-err' if f.level == 'error' else 'flag-warn' }}">{{ "错误" if f.level == "error" else "警告" }}</td>
+    <td class="l">{{ f.type }}</td>
+    <td class="l">{{ f.message }}</td>
+    <td class="l">{{ "已保留:" + f.reason if f.kept else "未保留" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p>无异常。</p>{% endif %}
+
+<h2>几何版本沿革</h2>
+<table>
+  <tr><th>版本</th><th>状态</th><th class="l">时间</th><th class="l">调整前参数</th></tr>
+  {% for v in versions %}
+  <tr>
+    <td>v{{ v.version }}</td>
+    <td>{{ "当前" if v.is_current else "已失效" }}</td>
+    <td class="l">{{ v.created_at }}</td>
+    <td class="l"><code>{{ v.previous_params if v.previous_params else "—" }}</code></td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="meta">复算方法:python -m tlc.recompute params.json --image 原图 --out spots.csv</p>
+</body>
+</html>

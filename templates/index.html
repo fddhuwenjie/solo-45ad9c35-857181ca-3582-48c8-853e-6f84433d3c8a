@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TLC 薄层色谱图像定量</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>TLC 图像定量</h1>
+  <div class="hdr-group">
+    <select id="analysisSelect" title="打开已有分析"></select>
+    <button id="btnNew">上传板面照片</button>
+    <button id="btnSample">载入样例板</button>
+    <input type="file" id="fileInput" accept="image/*" hidden>
+  </div>
+  <div class="hdr-group" id="exportGroup" hidden>
+    <span id="geomBadge" class="badge"></span>
+    <button id="btnVersions" title="几何版本与调整留痕">版本</button>
+    <a id="expPng" class="btn" href="#" target="_blank">标注图</a>
+    <a id="expCsv" class="btn" href="#" target="_blank">CSV</a>
+    <a id="expParams" class="btn" href="#" target="_blank">参数文件</a>
+    <a id="expPrint" class="btn" href="#" target="_blank">打印记录</a>
+  </div>
+</header>
+
+<div id="emptyState">
+  <p>上传一张 TLC 板面照片,或直接载入仓库自带样例(含拖尾、共洗脱与照明不均)。</p>
+</div>
+
+<main id="workspace" hidden>
+  <section id="stage">
+    <nav id="modeTabs">
+      <button data-mode="geometry">① 几何标定</button>
+      <button data-mode="lanes">② 泳道</button>
+      <button data-mode="peaks">③ 峰与积分</button>
+      <button data-mode="results">④ 结果</button>
+    </nav>
+    <nav id="viewTabs">
+      <button data-view="original">原图</button>
+      <button data-view="corrected">校正图</button>
+      <button data-view="background">背景</button>
+      <button data-view="signal">信号(背景扣除后)</button>
+    </nav>
+    <div id="hint"></div>
+    <div id="canvasWrap"><canvas id="cv"></canvas></div>
+    <div id="profileWrap" hidden>
+      <div id="profileTitle"></div>
+      <canvas id="profileCv" height="240"></canvas>
+    </div>
+  </section>
+
+  <aside id="sidebar">
+    <div class="panel" id="panelGeometry">
+      <h3>几何标定</h3>
+      <ol id="geomSteps">
+        <li data-step="0">点选板面四角(左上→右上→右下→左下)</li>
+        <li data-step="1">点选基线(点样线)上一点</li>
+        <li data-step="2">点选溶剂前沿上一点</li>
+        <li data-step="3">点选标尺两点并输入实际长度</li>
+      </ol>
+      <div class="row" id="scaleRow" hidden>
+        <label>标尺长度(mm)<input type="number" id="scaleMm" value="100" min="0.1" step="0.1"></label>
+      </div>
+      <div class="row">
+        <button id="geomPrev">上一步</button>
+        <button id="geomNext">下一步</button>
+        <button id="geomSubmit" class="primary" hidden>提交几何</button>
+      </div>
+      <div id="geomDerived" class="kv"></div>
+      <div id="geomResetNote" class="warn" hidden>重新提交几何将生成新版本,当前泳道/峰/定量结果随即失效(旧版本参数保留备查)。</div>
+    </div>
+
+    <div class="panel" id="panelLanes" hidden>
+      <h3>泳道</h3>
+      <div class="row">
+        <button id="btnAddLane">添加泳道(图上拖出)</button>
+      </div>
+      <ul id="laneList" class="itemlist"></ul>
+    </div>
+
+    <div class="panel" id="panelPeaks" hidden>
+      <h3>峰与积分</h3>
+      <div class="row wrap">
+        <button id="btnAuto">自动检测</button>
+        <button id="btnApplyProposed" hidden>应用建议</button>
+        <button id="btnAddPeak">手动添加</button>
+        <button id="btnSplit">拆分峰</button>
+        <button id="btnDelPeak" disabled>删除选中</button>
+      </div>
+      <ul id="peakList" class="itemlist"></ul>
+    </div>
+
+    <div class="panel" id="panelResults" hidden>
+      <h3>逐斑点结果 <button id="btnRecompute" title="重新计算">↻</button></h3>
+      <table id="resultTable">
+        <thead><tr>
+          <th>泳道</th><th>#</th><th>Rf</th><th>中心y</th><th>mm</th>
+          <th>面积</th><th>泳道%</th><th>全板%</th><th>异常</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="panelFlags" hidden>
+      <h3>异常与处置</h3>
+      <ul id="flagList" class="itemlist"></ul>
+    </div>
+  </aside>
+</main>
+
+<dialog id="versionsDialog">
+  <h3>几何版本(调整前后留痕)</h3>
+  <div id="versionsBody"></div>
+  <form method="dialog"><button>关闭</button></form>
+</dialog>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
