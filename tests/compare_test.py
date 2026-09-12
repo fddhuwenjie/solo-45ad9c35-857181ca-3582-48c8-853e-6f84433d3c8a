@@ -273,21 +273,57 @@ def e2e():
     assert member_of(st, mid=mids[0])["valid"]
     print("7. 次序颠倒:同泳道反序绑定被排除,拆开后恢复 ✔")
 
-    # 8. 泳道改动 -> 仅该成员的匹配/汇总失效;重配恢复
+    # 8. 泳道改动 -> 该成员匹配逐条失效;单独改绑 A 只恢复 A,其余继续失效;重配全恢复
+    st0 = get_state(c, cid)
+    m0_tA_area = match_of(st0, tA, mids[0])["spot"]["area"]
     lanes2 = c.get(f"/api/analyses/{aids[1]}").get_json()["lanes"]
     lanes2[0]["x0"] += 2.0
     c.post(f"/api/analyses/{aids[1]}/lanes", json={"lanes": [
         {"id": l["id"], "x0": l["x0"], "x1": l["x1"], "label": l["label"]} for l in lanes2]})
     st = get_state(c, cid)
     m1 = member_of(st, mid=mids[1])
-    assert m1["stale"] and not m1["valid"]
-    assert any("已修改" in p["message"] for p in m1["problems"])
-    assert member_of(st, mid=mids[2])["valid"], "其他成员不应受影响"
+    assert m1["stale"], "板数据变更后成员应处于 stale"
+    assert m1["stale_matches"] == 2, m1  # tA/tC 的绑定失效(tB 第 6 步已拆开)
+    assert not match_of(st, tA, mids[1])["valid"]
+    assert not match_of(st, tC, mids[1])["valid"]
+    for row in st["summary"]["rows"]:
+        assert all(e["member_id"] != mids[1] for e in row["entries"]), \
+            f"{row['target']['name']} 的失效匹配不得进入汇总"
+    # 其他成员不受影响:匹配仍有效,原始面积不变
+    assert match_of(st, tA, mids[0])["valid"]
+    assert match_of(st, tA, mids[0])["spot"]["area"] == m0_tA_area
+    rowA0 = next(r for r in st["summary"]["rows"] if r["target"]["id"] == tA)
+    assert any(e["member_id"] == mids[0] for e in rowA0["entries"])
+    print("8. 泳道边界改动 -> 该成员匹配逐条失效并排除,其他成员不受影响 ✔")
+
+    # 8b. 回归:单独改绑组分A -> 只有 A 恢复;未重新匹配的 C 继续失效
+    cand = match_of(st, tA, mids[1])["candidates"][0]
+    st = c.post(f"/api/comparisons/{cid}/matches/bind",
+                json={"target_id": tA, "member_id": mids[1],
+                      "peak_id": cand["peak_id"]}).get_json()
+    m1 = member_of(st, mid=mids[1])
+    assert m1["stale"], "改绑不刷新成员级指纹,成员仍 stale"
+    assert m1["stale_matches"] == 1, m1
+    assert match_of(st, tA, mids[1])["valid"], "改绑的 A 应恢复有效"
+    mtC = match_of(st, tC, mids[1])
+    assert mtC["stale"] and not mtC["valid"], "未重新匹配的 C 必须继续失效"
     rowA = next(r for r in st["summary"]["rows"] if r["target"]["id"] == tA)
-    assert all(e["member_id"] != mids[1] for e in rowA["entries"]), "失效成员不得进入汇总"
+    rowC = next(r for r in st["summary"]["rows"] if r["target"]["id"] == tC)
+    assert any(e["member_id"] == mids[1] for e in rowA["entries"]), "A 应回到汇总"
+    assert all(e["member_id"] != mids[1] for e in rowC["entries"]), \
+        "C 不得以旧 auto 关系重新进入汇总"
+    assert match_of(st, tA, mids[0])["valid"] and \
+        match_of(st, tA, mids[0])["spot"]["area"] == m0_tA_area, "其他成员不受影响"
+    print("   单独改绑 A:仅 A 恢复,C 保持失效并排除在汇总外 ✔")
+
+    # 8c. 重新匹配 -> 全部恢复
     st = c.post(f"/api/comparisons/{cid}/members/{mids[1]}/rematch", json={}).get_json()
-    assert member_of(st, mid=mids[1])["valid"]
-    print("8. 泳道边界改动 -> 仅该成员失效,重配恢复 ✔")
+    m1 = member_of(st, mid=mids[1])
+    assert not m1["stale"] and m1["stale_matches"] == 0
+    assert match_of(st, tC, mids[1])["valid"]
+    rowC = next(r for r in st["summary"]["rows"] if r["target"]["id"] == tC)
+    assert any(e["member_id"] == mids[1] for e in rowC["entries"])
+    print("   重新匹配后成员整体恢复 ✔")
 
     # 9. 几何改动 -> 失效
     moved = [[x + 3, y + 2] for x, y in META["corners"]]

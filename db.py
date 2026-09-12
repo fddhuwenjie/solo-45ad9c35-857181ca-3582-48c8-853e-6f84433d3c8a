@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS comparison_matches (
   lane_id INTEGER,
   status TEXT NOT NULL DEFAULT 'auto', -- auto=程序建议 | manual=用户改绑/拆开
   locked INTEGER NOT NULL DEFAULT 0,   -- 1=锁定确认,重配不再改动
+  data_fp TEXT NOT NULL DEFAULT '',    -- 该条关系确认时的板数据指纹;与当前指纹不符即失效
   updated_at TEXT NOT NULL,
   UNIQUE(target_id, member_id)
 );
@@ -105,6 +106,12 @@ def init_db(db_path):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     with connect(db_path) as con:
         con.executescript(SCHEMA)
+        # 轻量迁移:旧库 comparison_matches 缺少 data_fp 时补列
+        # (旧行 data_fp='' => 与当前指纹不符,匹配显示为失效,重新匹配即可恢复)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(comparison_matches)")}
+        if "data_fp" not in cols:
+            con.execute("ALTER TABLE comparison_matches"
+                        " ADD COLUMN data_fp TEXT NOT NULL DEFAULT ''")
 
 
 def row_to_dict(r):
@@ -325,16 +332,19 @@ def list_matches(con, cid):
     return [row_to_dict(r) for r in rows]
 
 
-def upsert_match(con, cid, target_id, member_id, peak_id, lane_id, status, locked):
+def upsert_match(con, cid, target_id, member_id, peak_id, lane_id, status, locked,
+                 data_fp=""):
     con.execute(
         """INSERT INTO comparison_matches
-           (comparison_id, target_id, member_id, peak_id, lane_id, status, locked, updated_at)
-           VALUES (?,?,?,?,?,?,?,?)
+           (comparison_id, target_id, member_id, peak_id, lane_id, status, locked,
+            data_fp, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(target_id, member_id)
            DO UPDATE SET peak_id=excluded.peak_id, lane_id=excluded.lane_id,
                          status=excluded.status, locked=excluded.locked,
-                         updated_at=excluded.updated_at""",
-        (cid, target_id, member_id, peak_id, lane_id, status, 1 if locked else 0, now()))
+                         data_fp=excluded.data_fp, updated_at=excluded.updated_at""",
+        (cid, target_id, member_id, peak_id, lane_id, status, 1 if locked else 0,
+         data_fp, now()))
 
 
 def set_match_lock(con, target_id, member_id, locked):

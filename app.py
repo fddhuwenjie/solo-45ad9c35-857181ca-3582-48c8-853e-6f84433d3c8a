@@ -459,7 +459,12 @@ def create_app(data_dir=None):
         }
 
     def auto_match_member(c, cid, mid):
-        """为成员生成/刷新自动匹配(不动 manual/locked),并把指纹刷新为当前数据。"""
+        """重新匹配成员:重算 auto 匹配,并把所有关系的指纹刷新为当前数据。
+
+        manual/locked 关系不被改写;若其引用的峰在当前数据中仍存在,
+        视为关系仍然成立,一并刷新指纹(重新确认);已消失的峰保持旧指纹,
+        在状态中显示为失效。成员级指纹同步刷新,成员脱离 stale。
+        """
         m = db.get_member(c, mid)
         if not m:
             return
@@ -472,17 +477,23 @@ def create_app(data_dir=None):
         assignment, offset, _ = compare.assign_standards(targets, std_spots, cfg)
         best, _ = compare.propose_targets(targets, d["spots"], m["std_lane_id"],
                                           offset or 0.0, assignment, d["profiles"], cfg)
+        fp = d["fingerprint"]
         existing = {mt["target_id"]: mt for mt in db.list_matches(c, cid)
                     if mt["member_id"] == mid}
+        live_peaks = {s["peak_id"] for s in d["spots"]}
         for t in targets:
             mt = existing.get(t["id"])
             if mt and (mt["locked"] or mt["status"] == "manual"):
+                if mt["peak_id"] in live_peaks and mt["data_fp"] != fp:
+                    # 手动/锁定关系引用的峰仍在:重新确认其数据版本
+                    db.upsert_match(c, cid, t["id"], mid, mt["peak_id"], mt["lane_id"],
+                                    mt["status"], mt["locked"], data_fp=fp)
                 continue
             cand = best.get(t["id"])
             db.upsert_match(c, cid, t["id"], mid,
                             cand["peak_id"] if cand else None,
-                            cand["lane_id"] if cand else None, "auto", 0)
-        db.update_member(c, mid, fingerprint=d["fingerprint"])
+                            cand["lane_id"] if cand else None, "auto", 0, data_fp=fp)
+        db.update_member(c, mid, fingerprint=fp)
 
     def comparison_state(c, cid):
         """组装对照组完整状态:成员质控、候选、匹配、汇总(被排除者附原因)。"""
@@ -508,12 +519,10 @@ def create_app(data_dir=None):
                 infos.append(info)
                 continue
             info["data"] = d
+            # 板数据变更不再整板阻断:成员级 stale 仅作提示,
+            # 具体哪条匹配失效按各匹配自带的 data_fp 逐条判定(见下)。
             if d["fingerprint"] != m["fingerprint"]:
                 info["stale"] = True
-                info["problems"].append({
-                    "type": "stale",
-                    "message": "该板的几何/泳道/积分边界在加入对照后已修改,"
-                               "引用它的匹配已失效,请重新匹配"})
             lane_ids = {l["id"] for l in d["bundle"]["lanes"]}
             if m["std_lane_id"] not in lane_ids:
                 info["problems"].append({"type": "std_missing",
@@ -550,13 +559,34 @@ def create_app(data_dir=None):
                     "message": f"归一化系数 {coefs[mid]:.2f} 离群"
                                f"(超出 [{1 / r:.2f}, {r:.2f}])"})
 
-        # 次序颠倒检查(对当前已确认关系) + 汇总
+        # 逐条匹配判定有效性:峰已绑定 + 关系确认时的数据版本与当前一致 + 斑点仍存在。
+        # 板数据变更后,只有被重新匹配/改绑确认过的关系才有效,
+        # 其余保持失效并排除在汇总外(旧 auto 关系不会随成员状态自动复活)。
+        info_by_mid = {i["member"]["id"]: i for i in infos}
+        match_state = {}   # (target_id, member_id) -> {"valid": bool, "stale": bool}
+        for mt in matches:
+            info = info_by_mid.get(mt["member_id"])
+            d = info["data"] if info else None
+            if mt["peak_id"] is None:
+                match_state[(mt["target_id"], mt["member_id"])] = \
+                    {"valid": False, "stale": False}
+                continue
+            cur_fp = d["fingerprint"] if d else None
+            spot = (next((s for s in d["spots"] if s["peak_id"] == mt["peak_id"]), None)
+                    if d else None)
+            synced = cur_fp is not None and mt["data_fp"] == cur_fp
+            match_state[(mt["target_id"], mt["member_id"])] = {
+                "valid": bool(synced and spot), "stale": not synced}
+
+        # 次序颠倒检查(只对当前有效的确认关系)
         for info in infos:
             d = info["data"]
             if not d:
                 continue
             mid = info["member"]["id"]
-            mmatches = [mt for mt in matches if mt["member_id"] == mid and mt["peak_id"]]
+            mmatches = [mt for mt in matches
+                        if mt["member_id"] == mid and mt["peak_id"]
+                        and match_state[(mt["target_id"], mid)]["valid"]]
             spots_by_peak = {s["peak_id"]: s for s in d["spots"]}
             bad = compare.order_violations(targets, mmatches, spots_by_peak)
             if bad:
@@ -575,6 +605,8 @@ def create_app(data_dir=None):
             lanes = d["bundle"]["lanes"] if d else []
             std_lane = next((l for l in lanes if l["id"] == m["std_lane_id"]), None)
             tname = {t["id"]: t["name"] for t in targets}
+            n_stale = sum(1 for (tid, mid), ms in match_state.items()
+                          if mid == m["id"] and ms["stale"])
             out_members.append({
                 "id": m["id"], "analysis_id": m["analysis_id"],
                 "analysis_name": a["name"] if a else f"#{m['analysis_id']}",
@@ -582,6 +614,7 @@ def create_app(data_dir=None):
                 "std_lane_id": m["std_lane_id"],
                 "std_lane_label": std_lane["label"] if std_lane else "",
                 "valid": not info["problems"], "stale": info["stale"],
+                "stale_matches": n_stale,
                 "problems": info["problems"],
                 "coef": info["coef"], "offset": info["offset"],
                 "response": info["response"],
@@ -593,8 +626,7 @@ def create_app(data_dir=None):
                               for tid, s in info["assignment"].items()],
             })
 
-        # 输出匹配(附斑点详情与候选)
-        info_by_mid = {i["member"]["id"]: i for i in infos}
+        # 输出匹配(附斑点详情、候选与逐条有效性)
         out_matches = []
         for mt in matches:
             info = info_by_mid.get(mt["member_id"])
@@ -602,10 +634,12 @@ def create_app(data_dir=None):
             spot = None
             if d and mt["peak_id"] is not None:
                 spot = next((s for s in d["spots"] if s["peak_id"] == mt["peak_id"]), None)
+            ms = match_state[(mt["target_id"], mt["member_id"])]
             out_matches.append({
                 "target_id": mt["target_id"], "member_id": mt["member_id"],
                 "peak_id": mt["peak_id"], "lane_id": mt["lane_id"],
                 "status": mt["status"], "locked": bool(mt["locked"]),
+                "valid": ms["valid"], "stale": ms["stale"],
                 "spot": ({k: spot[k] for k in
                           ("peak_id", "lane_id", "lane_label", "spot_no", "rf",
                            "area", "center_y", "y0", "y1")} if spot else None),
@@ -613,7 +647,7 @@ def create_app(data_dir=None):
                                if info else []),
             })
 
-        # 汇总:只纳入通过质控的成员
+        # 汇总:成员须无阻断性问题,且该目标匹配逐条判定有效
         summary_rows = []
         for t in sorted(targets, key=lambda t: t["rf_ref"]):
             entries = []
@@ -623,6 +657,8 @@ def create_app(data_dir=None):
                 mid = info["member"]["id"]
                 mt = match_by.get((t["id"], mid))
                 if not mt or not mt["peak_id"]:
+                    continue
+                if not match_state[(t["id"], mid)]["valid"]:
                     continue
                 spot = next((s for s in info["data"]["spots"]
                              if s["peak_id"] == mt["peak_id"]), None)
@@ -808,9 +844,10 @@ def create_app(data_dir=None):
                     abort(400, "不能绑定标准品泳道上的斑点")
                 lane_id = spot["lane_id"]
                 peak_id = int(peak_id)
+            # 只把这一条关系确认到当前数据版本;其余匹配不受影响,
+            # 未重新确认的匹配在板数据变更后继续保持失效。
             db.upsert_match(c, cid, tid, mid, peak_id, lane_id, "manual",
-                            bool(cur and cur["locked"]))
-            db.update_member(c, mid, fingerprint=d["fingerprint"])
+                            bool(cur and cur["locked"]), data_fp=d["fingerprint"])
             return jsonify(comparison_state(c, cid))
 
     @app.post("/api/comparisons/<int:cid>/matches/lock")
@@ -866,6 +903,20 @@ def create_app(data_dir=None):
                             ex["analysis_name"], m["geometry_version"],
                             m["std_lane_label"], "", "", "", "", "", "", "", "", 0, 0,
                             ";".join(ex["reasons"]), "", "", "", "", "", ""])
+            # 成员未整体排除但单条匹配失效(板数据变更后未重新确认)也逐条留痕
+            tname = {t["id"]: t["name"] for t in st["targets"]}
+            for mt in st["matches"]:
+                if not mt["stale"]:
+                    continue
+                m = mname[mt["member_id"]]
+                if not m["valid"]:
+                    continue   # 成员整体排除,上面已列原因
+                w.writerow([cid, comp["name"], tname.get(mt["target_id"], ""), "", "",
+                            m["analysis_id"], m["analysis_name"], m["geometry_version"],
+                            m["std_lane_label"], "", "", mt["peak_id"] or "", "", "",
+                            "", "", mt["status"], 1 if mt["locked"] else 0, 0,
+                            "板数据已变更,该匹配未重新确认(改绑或重新匹配)",
+                            "", "", "", "", "", ""])
             mem = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
             mem.seek(0)
             return send_file(mem, mimetype="text/csv", as_attachment=True,
@@ -883,11 +934,12 @@ def create_app(data_dir=None):
                 "members": [{k: m[k] for k in
                              ("id", "analysis_id", "analysis_name", "geometry_version",
                               "std_lane_id", "std_lane_label", "valid", "stale",
-                              "problems", "coef", "offset", "response", "standards")}
+                              "stale_matches", "problems", "coef", "offset",
+                              "response", "standards")}
                             for m in st["members"]],
                 "matches": [{k: mt[k] for k in
                              ("target_id", "member_id", "peak_id", "lane_id",
-                              "status", "locked", "spot")}
+                              "status", "locked", "valid", "stale", "spot")}
                             for mt in st["matches"]],
                 "summary": st["summary"],
             }
@@ -920,6 +972,13 @@ def create_app(data_dir=None):
                     if not lane:
                         continue
                     ti = tidx.get(mt["target_id"], 0)
+                    if mt["stale"]:
+                        # 失效匹配:灰色标记,不参与连线
+                        marks.append({
+                            "x": (lane["x0"] + lane["x1"]) / 2, "y": mt["spot"]["center_y"],
+                            "color": "#778899", "label": f"T{ti + 1}x",
+                            "locked": False})
+                        continue
                     mark_index[(mt["target_id"], m["id"])] = (pi, len(marks))
                     marks.append({
                         "x": (lane["x0"] + lane["x1"]) / 2, "y": mt["spot"]["center_y"],

@@ -162,8 +162,16 @@ function drawStrip() {
       if (!lane) continue;
       const cx = g.x + (lane.x0 + lane.x1) / 2 * g.k;
       const cy = HEAD + mt.spot.center_y * g.k;
-      const color = tColor(mt.target_id);
       const ti = tIndex(mt.target_id);
+      if (mt.stale) {
+        // 失效匹配:灰色空心标记,不参与连线
+        ctx.strokeStyle = "#778"; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 7); ctx.stroke();
+        ctx.fillStyle = "#778";
+        ctx.fillText(`T${ti + 1}✕`, cx + 7, cy - 4);
+        continue;
+      }
+      const color = tColor(mt.target_id);
       markBy[`${mt.target_id}:${m.id}`] = { x: cx, y: cy };
       S.markers.push({ x: cx, y: cy, target_id: mt.target_id, member_id: m.id });
       ctx.strokeStyle = color; ctx.lineWidth = 2;
@@ -328,8 +336,14 @@ function cellHtml(t, m, mt) {
   if (!mt || !mt.peak_id) {
     return `<span class="dim">—</span><br><button data-act="edit">改绑</button>`;
   }
+  if (mt.stale) {
+    // 板数据变更后该关系未重新确认,不进入汇总
+    const old = mt.spot ? ` ${esc(mt.spot.lane_label || "L")}-${mt.spot.spot_no}` : "";
+    return `<span class="warn">已失效${old}(数据已变更)</span><br>` +
+      `<button data-act="edit">改绑</button><button data-act="unbind">拆开</button>`;
+  }
   if (!mt.spot) {
-    // 绑定关系引用的斑点已不存在(板数据变更后未重配)
+    // 绑定关系引用的斑点已不存在
     return `<span class="warn">斑点已失效</span><br><button data-act="edit">改绑</button>` +
       `<button data-act="unbind">拆开</button>`;
   }
@@ -405,14 +419,18 @@ function renderMembers() {
   ul.innerHTML = "";
   for (const m of S.st.members) {
     const li = document.createElement("li");
-    li.className = m.valid ? "" : "invalid";
+    li.className = m.valid ? (m.stale ? "stale" : "") : "invalid";
     const probs = m.valid ? "" :
       `<br><span class="warn">${m.problems.map(p => esc(p.message)).join("<br>")}</span>`;
+    const staleNote = (m.valid && m.stale)
+      ? `<br><span class="warn">板数据已变更:${m.stale_matches} 条匹配待重新确认` +
+        `(逐条改绑或整体重新匹配)</span>`
+      : "";
     li.innerHTML = `<span class="grow">#${m.analysis_id} ${esc(m.analysis_name)}<br>` +
       `<span class="dim">几何v${m.geometry_version}` +
       (m.coef != null ? ` · 系数 ${m.coef.toFixed(3)}` : "") +
       (m.offset != null ? ` · Rf偏移 ${m.offset >= 0 ? "+" : ""}${m.offset.toFixed(3)}` : "") +
-      `</span>${probs}</span>`;
+      `</span>${probs}${staleNote}</span>`;
     // 标准品泳道选择(泳道被重建后需重新指定)
     const sel = document.createElement("select");
     sel.title = "标准品泳道";
