@@ -96,3 +96,13 @@ td.cell select { max-width: 150px; font-size: 11px; padding: 2px; }
 #summaryBody h4 { margin: 12px 0 4px; }
 #summaryBody .kv { margin: 2px 0 8px; }
 #excludedBody ul { margin: 4px 0; padding-left: 18px; color: var(--warn); font-size: 12px; }
+
+/* ---- 校准曲线 ---- */
+#plateWrap, #calCv, #resCv { background: #14161a; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+#laneTable tr.selected td { background: #2d3a4d; }
+#laneTable td { white-space: nowrap; }
+#laneTable input[type=text] { width: 96px; }
+#versionBody table td, #modelBody table td { text-align: right; }
+.flag a { font-size: 12px; }
+dialog table { font-size: 11px; }
+dialog h4 { margin: 12px 0 4px; font-size: 13px; }

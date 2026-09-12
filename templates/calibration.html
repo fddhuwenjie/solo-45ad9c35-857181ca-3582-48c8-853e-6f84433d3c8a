@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>校准曲线与含量反算 — TLC 图像定量</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>校准曲线与含量反算</h1>
+  <div class="hdr-group">
+    <select id="calSelect" title="打开已有校准"></select>
+    <a class="btn" href="/">单板定量</a>
+    <a class="btn" href="/compare">跨板对照</a>
+  </div>
+  <div class="hdr-group" id="calExports" hidden>
+    <span id="calBadge" class="badge"></span>
+    <a id="expSamples" class="btn" href="#" target="_blank">逐样品 CSV</a>
+    <a id="expModel" class="btn" href="#" target="_blank">模型 JSON</a>
+    <a id="expFig" class="btn" href="#" target="_blank">校准图</a>
+  </div>
+</header>
+
+<div id="emptyState">
+  <p>从已完成定量的板中选定目标成分,把同板展开的泳道标为标准 / 空白 / 未知样,<br>
+     填写标准浓度、进样体积与稀释倍数并绑定对应斑点。程序按普通线性 / 过零线性 / 1/x 加权线性成线,<br>
+     反算未知样含量;标准点不足、响应冲突、不单调、空白异常或样品超范围时只定位、不出含量结论。</p>
+  <div class="newCal" style="margin-top:24px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap">
+    <select id="newAnalysis" title="选择已完成定量的板"></select>
+    <input type="text" id="newName" placeholder="校准名称(如:批2026-09-A)" size="22">
+    <input type="text" id="newTarget" placeholder="目标成分" size="12">
+    <input type="number" id="newRf" placeholder="目标Rf" step="0.01" min="0" max="1" style="width:84px" title="用于自动建议同 Rf 斑点,可留空">
+    <input type="text" id="newConcUnit" placeholder="浓度单位" value="ng/uL" style="width:74px">
+    <input type="text" id="newVolUnit" placeholder="体积单位" value="uL" style="width:60px">
+    <button id="btnNewCal" class="primary">新建校准</button>
+  </div>
+</div>
+
+<main id="workspace" hidden>
+  <section id="stage">
+    <div id="hint"></div>
+
+    <div class="panel">
+      <h3>板面泳道与斑点绑定
+        <span class="dim">行=泳道(点击定位到下方板面);标准行填浓度/体积,未知样填体积/稀释;排除标准点必须写理由</span>
+      </h3>
+      <div style="overflow-x:auto">
+      <table id="laneTable">
+        <thead><tr>
+          <th style="text-align:left">泳道</th>
+          <th>角色</th>
+          <th>绑定斑点</th>
+          <th>浓度 <span id="hConcUnit"></span></th>
+          <th>进样体积 <span id="hVolUnit"></span></th>
+          <th>稀释倍数</th>
+          <th>面积</th>
+          <th>Rf</th>
+          <th>排除 / 理由</th>
+          <th>状态</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>板面定位 <span class="dim">蓝=标准 · 灰=空白 · 橙=未知样;红框=问题泳道,圈=绑定斑点</span></h3>
+      <div id="plateWrap"><canvas id="plateCv"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>校准图 <span class="dim">散点 = 标准点(标签=泳道-斑点#/峰ID),红线=拟合线,三角=未知样反算投影</span></h3>
+      <canvas id="calCv" height="460"></canvas>
+      <canvas id="resCv" height="150" style="margin-top:4px"></canvas>
+    </div>
+
+    <div class="panel">
+      <h3>模型结果</h3>
+      <div id="modelBody"></div>
+    </div>
+
+    <div class="panel">
+      <h3>未知样含量反算</h3>
+      <table id="sampleTable">
+        <thead><tr>
+          <th style="text-align:left">泳道</th><th>斑点</th><th>面积</th>
+          <th>点样量反算</th><th>点样液浓度</th><th>原样品浓度</th>
+          <th>范围内</th><th>状态 / 原因</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>历史模型版本(来源变化后旧结果标为过期,仍可查看/导出)</h3>
+      <div id="versionBody"></div>
+    </div>
+  </section>
+
+  <aside id="sidebar">
+    <div class="panel">
+      <h3>校准设置</h3>
+      <div class="row wrap">
+        <label>名称<input type="text" id="fName" style="width:150px"></label>
+        <button id="btnSaveMeta">保存</button>
+        <button id="btnDeleteCal">删除校准</button>
+      </div>
+      <div class="row wrap">
+        <label>目标成分<input type="text" id="fTarget" style="width:120px"></label>
+        <label>目标 Rf<input type="number" id="fRf" step="0.01" min="0" max="1" style="width:70px"></label>
+        <label>建议容差<input type="number" id="fTol" step="0.01" min="0.01" max="0.5" style="width:64px"></label>
+      </div>
+      <div class="row wrap">
+        <label>浓度单位<input type="text" id="fConcUnit" style="width:80px"></label>
+        <label>体积单位<input type="text" id="fVolUnit" style="width:64px"></label>
+      </div>
+      <div class="row">
+        <button id="btnSuggest">按目标 Rf 自动绑定</button>
+      </div>
+      <div class="kv" id="metaHint"></div>
+    </div>
+
+    <div class="panel">
+      <h3>模型</h3>
+      <div class="row wrap" id="modelPick"></div>
+      <div class="row">
+        <button id="btnFit" class="primary">保存当前模型为新版本</button>
+      </div>
+      <div id="fitHint" class="warn"></div>
+      <div class="kv" id="modelKv"></div>
+    </div>
+
+    <div class="panel">
+      <h3>判定阈值</h3>
+      <div class="kv" id="thresholds"></div>
+    </div>
+  </aside>
+</main>
+
+<script src="{{ url_for('static', filename='calibration.js') }}"></script>
+</body>
+</html>

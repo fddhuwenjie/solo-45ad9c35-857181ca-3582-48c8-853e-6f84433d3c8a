@@ -16,7 +16,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_file, se
 from PIL import Image
 
 import db
-from tlc import TOOL, __version__, annotate, background, compare, geometry, pipeline, profile, qc
+from tlc import TOOL, __version__, annotate, background, calibration, compare, geometry, pipeline, profile, qc
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_IMAGE = os.path.join(BASE_DIR, "sample", "sample_plate.png")
@@ -34,6 +34,14 @@ def create_app(data_dir=None):
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
     app.json.ensure_ascii = False
+
+    @app.errorhandler(400)
+    @app.errorhandler(404)
+    def json_error(e):
+        # /api 路径统一返回 JSON 错误描述,供前端 alert;页面路由交给默认处理器
+        if request.path.startswith("/api/"):
+            return jsonify({"error": e.code, "description": e.description}), e.code
+        raise e
 
     def con():
         return db.connect(db_path)
@@ -108,6 +116,10 @@ def create_app(data_dir=None):
     @app.get("/")
     def index():
         return render_template("index.html")
+
+    @app.get("/calibration")
+    def calibration_page():
+        return render_template("calibration.html")
 
     # ---------- 分析管理 ----------
 
@@ -1017,6 +1029,508 @@ def create_app(data_dir=None):
             legend.append(("#9aa3ad", "solid=locked  dashed=unconfirmed"))
             img = compare.draw_comparison(panels, links, legend)
             path = os.path.join(exports, f"c{cid}_compare.png")
+            img.save(path)
+            return send_file(path, mimetype="image/png",
+                             as_attachment=request.args.get("dl") == "1",
+                             download_name=os.path.basename(path))
+
+    # ---------- 校准曲线与含量反算 ----------
+
+    cal_cache = {}   # analysis_id -> {fp, data}
+
+    def cal_plate_data(c, aid):
+        """单板当前数据(分析/几何/泳道斑点/指纹),按指纹缓存(同 member_compute)。"""
+        rec = cal_cache.get(aid)
+        a, bundle = bundle_for(c, aid)
+        if not a:
+            return None
+        if not bundle:
+            return {"analysis": a, "bundle": None, "spots": [],
+                    "fingerprint": "", "geometry_version": None}
+        fp = member_fingerprint(bundle)
+        if rec and rec["fp"] == fp:
+            return rec["data"]
+        result = pipeline.compute_bundle(a["image_path"], bundle)
+        lane_label = {l["id"]: l["label"] for l in bundle["lanes"]}
+        spots = []
+        for s in result["spots"]:
+            s2 = dict(s)
+            s2["lane_label"] = lane_label.get(s["lane_id"], "")
+            spots.append(s2)
+        data = {"analysis": a, "bundle": bundle, "spots": spots,
+                "fingerprint": fp, "geometry_version": bundle["geometry_version"]}
+        cal_cache[aid] = {"fp": fp, "data": data}
+        return data
+
+    def _spot_brief(s):
+        return {"peak_id": s["peak_id"], "spot_no": s.get("spot_no"), "rf": s["rf"],
+                "area": s["area"], "center_y": s["center_y"], "y0": s["y0"], "y1": s["y1"],
+                "height": s["height"]}
+
+    def _roles_from_rows(rows, lane_by_id, spots_by_lane, target_rf, tol):
+        """把持久化的标注行映射为 evaluate() 输入与前端 lane 条目。"""
+        spot_by_peak = {}
+        for lspots in spots_by_lane.values():
+            for s in lspots:
+                spot_by_peak[s["peak_id"]] = s
+        standards, blanks, unknowns = [], [], []
+        lane_entries = {}
+        for r in rows:
+            lid = r["lane_id"]
+            role = r["role"]
+            lane = lane_by_id.get(lid)
+            if lane is None:
+                # 几何/泳道重建后的失效标注:不参与本次评估,仅在泳道表中列出待清理
+                lane_entries[lid] = {
+                    "lane_id": lid, "role": role, "peak_id": r["peak_id"],
+                    "concentration": r["concentration"], "volume": r["volume"],
+                    "dilution": r["dilution"], "excluded": bool(r["excluded"]),
+                    "exclude_reason": r["exclude_reason"],
+                    "bound_spot": None, "binding_valid": False, "suggestion": None}
+                continue
+            lane_label = lane["label"] if lane else ""
+            spot = spot_by_peak.get(r["peak_id"]) if r["peak_id"] else None
+            suggestion = calibration.suggest_spot(
+                spots_by_lane.get(lid, []), target_rf, tol) if target_rf is not None else None
+            entry = {
+                "lane_id": lid, "role": role,
+                "peak_id": r["peak_id"], "concentration": r["concentration"],
+                "volume": r["volume"], "dilution": r["dilution"],
+                "excluded": bool(r["excluded"]), "exclude_reason": r["exclude_reason"],
+                "bound_spot": _spot_brief(spot) if spot else None,
+                "binding_valid": spot is not None if r["peak_id"] else True,
+                "suggestion": _spot_brief(suggestion) if suggestion else None,
+            }
+            lane_entries[lid] = entry
+            base = {"lane_id": lid, "lane_label": lane_label}
+            if role == "standard":
+                standards.append({
+                    **base, "peak_id": r["peak_id"],
+                    "spot_no": spot.get("spot_no") if spot else None,
+                    "rf": spot["rf"] if spot else None,
+                    "response": spot["area"] if spot else None,
+                    "y0": spot["y0"] if spot else None, "y1": spot["y1"] if spot else None,
+                    "concentration": r["concentration"], "volume": r["volume"],
+                    "excluded": bool(r["excluded"]),
+                    "exclude_reason": r["exclude_reason"]})
+            elif role == "blank":
+                blanks.append({
+                    **base, "peak_id": r["peak_id"],
+                    "response": spot["area"] if spot else None})
+            elif role == "unknown":
+                unknowns.append({
+                    **base, "peak_id": r["peak_id"],
+                    "spot_no": spot.get("spot_no") if spot else None,
+                    "rf": spot["rf"] if spot else None,
+                    "response": spot["area"] if spot else None,
+                    "y0": spot["y0"] if spot else None, "y1": spot["y1"] if spot else None,
+                    "volume": r["volume"], "dilution": r["dilution"]})
+        return standards, blanks, unknowns, lane_entries
+
+    def calibration_state(c, cal_id):
+        """组装校准页完整状态:板面泳道/候选斑点、标注、实时评估、历史版本与过期标记。"""
+        cal = db.get_calibration(c, cal_id)
+        if not cal:
+            abort(404, "校准不存在")
+        data = cal_plate_data(c, cal["analysis_id"])
+        analysis = data["analysis"]
+        bundle = data["bundle"]
+        rows = db.list_cal_lanes(c, cal_id)
+
+        out = {"calibration": cal, "analysis": {
+                   "id": analysis["id"], "name": analysis["name"],
+                   "geometry_version": data["geometry_version"]},
+               "lanes": [], "evaluation": None, "versions": [],
+               "defaults": dict(calibration.DEFAULTS),
+               "models": [{"kind": m, "label": calibration.MODEL_LABELS[m]}
+                          for m in calibration.MODELS]}
+
+        if not bundle:
+            out["no_geometry"] = True
+            return out
+        spots_by_lane = {}
+        lane_by_id = {}
+        for l in bundle["lanes"]:
+            lane_by_id[l["id"]] = l
+            spots_by_lane[l["id"]] = [s for s in data["spots"] if s["lane_id"] == l["id"]]
+        row_lane_ids = {r["lane_id"] for r in rows}
+        missing = sorted(row_lane_ids - set(spots_by_lane))
+        standards, blanks, unknowns, entries = _roles_from_rows(
+            rows, lane_by_id, spots_by_lane, cal["target_rf"], cal["rf_tol"])
+        ev = calibration.evaluate(
+            standards, blanks, unknowns, cal["model"],
+            target_name=cal["target_name"])
+        out["evaluation"] = ev
+        out["derived"] = bundle["geometry"]["derived"]
+
+        # 泳道视图(全部泳道 + 每条泳道可选斑点与程序建议)
+        for l in bundle["lanes"]:
+            lspots = sorted(spots_by_lane[l["id"]], key=lambda s: s["rf"])
+            e = entries.get(l["id"])
+            out["lanes"].append({
+                "id": l["id"], "x0": l["x0"], "x1": l["x1"], "label": l["label"],
+                "spots": [_spot_brief(s) for s in lspots],
+                "role": e["role"] if e else None,
+                "annotation": e if e else None,
+            })
+        # 几何重建后旧泳道消失:标注行仍保留(供追溯),单独列出以便用户删除/重建
+        lane_by_id_now = {l["id"]: l for l in bundle["lanes"]}
+        for lid in missing:
+            r = next(rr for rr in rows if rr["lane_id"] == lid)
+            out["lanes"].append({
+                "id": lid, "x0": None, "x1": None,
+                "label": f"(旧泳道 #{lid})", "spots": [], "role": r["role"],
+                "annotation": entries[lid], "orphan": True})
+        out["missing_lanes"] = missing
+
+        # 历史版本(含过期判定)
+        for v in db.list_cal_versions(c, cal_id):
+            v["stale"] = v["source_fp"] != data["fingerprint"]
+            snap = None
+            if v["id"] == cal["current_version"]:
+                snap_row = db.get_cal_version(c, v["id"])
+                snap = snap_row["snapshot"]
+            v["snapshot"] = snap
+            out["versions"].append(v)
+        return out
+
+    def _check_lane_payload(c, aid, cal_id, payload):
+        data = cal_plate_data(c, aid)
+        live = set()
+        bundle = data["bundle"] if data else None
+        if bundle is not None:
+            live = {l["id"] for l in bundle["lanes"]}
+        removed = [int(x) for x in (payload.get("removed_lane_ids") or [])]
+        for lid in removed:
+            if lid in live:
+                abort(400, f"泳道 {lid} 仍存在,不能按失效泳道删除")
+        lanes_in = payload.get("lanes", [])
+        if bundle is None and lanes_in:
+            abort(400, "该板尚未完成几何标定,不能标注泳道(可先清除失效标注)")
+        peak_lanes = {}
+        if bundle is not None:
+            for s in data["spots"]:
+                peak_lanes[s["peak_id"]] = s["lane_id"]
+        clean = []
+        for l in payload.get("lanes", []):
+            lid = int(l["lane_id"])
+            if lid not in live:
+                abort(400, f"泳道 {lid} 不属于该板当前几何版本")
+            role = l.get("role", "unknown")
+            if role not in ("standard", "blank", "unknown"):
+                abort(400, f"泳道 {lid} 角色无效")
+            peak_id = l.get("peak_id")
+            if peak_id is not None:
+                peak_id = int(peak_id)
+                if peak_lanes.get(peak_id) != lid:
+                    abort(400, f"绑定的斑点 {peak_id} 不属于泳道 {lid}")
+
+            def num(k):
+                v = l.get(k)
+                if v in (None, "", []):
+                    return None
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    abort(400, f"泳道 {lid} 数值无效")
+                return v
+
+            excluded = bool(l.get("excluded"))
+            reason = (l.get("exclude_reason") or "").strip()
+            if excluded and role == "standard" and not reason:
+                abort(400, f"排除标准点(泳道 {lid})必须填写理由")
+            # 角色无关字段不落库,避免标准/未知样互改后残留旧数值
+            conc = num("concentration") if role == "standard" else None
+            vol = num("volume") if role in ("standard", "unknown") else None
+            dil = num("dilution") if role == "unknown" else None
+            if role != "standard":
+                excluded, reason = False, ""
+            clean.append({
+                "lane_id": lid, "role": role, "peak_id": peak_id,
+                "concentration": conc, "volume": vol, "dilution": dil,
+                "excluded": excluded, "exclude_reason": reason})
+        return data, clean, peak_lanes, removed
+
+    @app.get("/api/calibrations/by-analysis/<int:aid>")
+    def list_calibrations(aid):
+        with con() as c:
+            get_analysis_or_404(c, aid)
+            return jsonify(db.list_calibrations(c, aid))
+
+    @app.post("/api/analyses/<int:aid>/calibrations")
+    def create_calibration(aid):
+        p = request.get_json(force=True) or {}
+        name = (p.get("name") or "").strip()
+        target = (p.get("target_name") or "").strip()
+        if not name or not target:
+            abort(400, "需填写校准名称与目标成分")
+        try:
+            rf = p.get("target_rf")
+            target_rf = None if rf in (None, "") else float(rf)
+            rf_tol = float(p.get("rf_tol") or calibration.DEFAULTS["rf_hint_tol"])
+            if target_rf is not None and not (0 <= target_rf <= 1):
+                raise ValueError
+            if not (0.001 <= rf_tol <= 0.5):
+                raise ValueError
+        except (TypeError, ValueError):
+            abort(400, "目标 Rf 需在 [0,1],容差在 [0.001,0.5]")
+        conc_unit = (p.get("conc_unit") or "ng/uL").strip()[:16]
+        vol_unit = (p.get("vol_unit") or "uL").strip()[:16]
+        with con() as c:
+            get_analysis_or_404(c, aid)
+            cal_id = db.create_calibration(c, aid, name, target, target_rf, rf_tol,
+                                           conc_unit, vol_unit)
+            return jsonify(calibration_state(c, cal_id))
+
+    @app.get("/api/calibrations/<int:cal_id>")
+    def get_calibration(cal_id):
+        with con() as c:
+            return jsonify(calibration_state(c, cal_id))
+
+    @app.post("/api/calibrations/<int:cal_id>/update")
+    def update_calibration_meta(cal_id):
+        p = request.get_json(force=True) or {}
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            fields = {}
+            for k in ("name", "target_name", "conc_unit", "vol_unit"):
+                if k in p:
+                    v = (str(p[k]) if p[k] is not None else "").strip()
+                    if k in ("name", "target_name") and not v:
+                        abort(400, "名称与目标成分不能为空")
+                    fields[k] = v[:16] if k.endswith("unit") else v
+            if "target_rf" in p:
+                rf = p["target_rf"]
+                fields["target_rf"] = None if rf in (None, "") else float(rf)
+                if fields["target_rf"] is not None and not (0 <= fields["target_rf"] <= 1):
+                    abort(400, "目标 Rf 需在 [0,1]")
+            if "rf_tol" in p:
+                fields["rf_tol"] = float(p["rf_tol"])
+                if not (0.001 <= fields["rf_tol"] <= 0.5):
+                    abort(400, "容差需在 [0.001,0.5]")
+            db.update_calibration(c, cal_id, fields)
+            return jsonify(calibration_state(c, cal_id))
+
+    @app.post("/api/calibrations/<int:cal_id>/lanes")
+    def set_cal_lanes(cal_id):
+        payload = request.get_json(force=True) or {}
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            data2, clean, _, removed = _check_lane_payload(c, cal["analysis_id"], cal_id, payload)
+            live = {l["id"] for l in data2["bundle"]["lanes"]} if data2["bundle"] else set()
+            db.replace_cal_lanes(c, cal_id, clean, live_lane_ids=live,
+                                 remove_lane_ids=removed)
+            return jsonify(calibration_state(c, cal_id))
+
+    @app.post("/api/calibrations/<int:cal_id>/evaluate")
+    def preview_calibration(cal_id):
+        """实时预览:先把提交的标注落库,再按给定模型评估(不生成版本)。"""
+        payload = request.get_json(force=True) or {}
+        model = payload.get("model", "linear")
+        if model not in calibration.MODELS:
+            abort(400, "未知模型")
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            data2, clean, _, removed = _check_lane_payload(c, cal["analysis_id"], cal_id, payload)
+            live = {l["id"] for l in data2["bundle"]["lanes"]} if data2["bundle"] else set()
+            db.replace_cal_lanes(c, cal_id, clean, live_lane_ids=live,
+                                 remove_lane_ids=removed)
+            db.update_calibration(c, cal_id, {"model": model})
+            return jsonify(calibration_state(c, cal_id))
+
+    def _build_snapshot(cal, data, ev):
+        """成线快照:几何、背景/检测参数、每条来源的积分边界与斑点 ID、评估结果。"""
+        bundle = data["bundle"]
+        spot_by_peak = {s["peak_id"]: s for s in data["spots"]}
+
+        def enrich(p):
+            s = spot_by_peak.get(p["peak_id"])
+            return {**p, "y0": s["y0"] if s else p.get("y0"),
+                    "y1": s["y1"] if s else p.get("y1"),
+                    "center_y": s["center_y"] if s else None,
+                    "saturated_px": s.get("saturated_px") if s else None}
+
+        snap = {
+            "tool": TOOL, "tool_version": __version__,
+            "saved_at": db.now(),
+            "analysis_id": cal["analysis_id"],
+            "analysis_name": data["analysis"]["name"],
+            "image_sha1": data["analysis"]["image_sha1"],
+            "geometry_version": bundle["geometry_version"],
+            "geometry": bundle["geometry"],
+            "background": bundle.get("background"),
+            "detection": bundle.get("detection"),
+            "qc": bundle.get("qc"),
+            "target": {"name": cal["target_name"], "rf": cal["target_rf"],
+                       "rf_tol": cal["rf_tol"]},
+            "units": {"conc": cal["conc_unit"], "vol": cal["vol_unit"]},
+            "model": ev["model"],
+            "fit": ev["fit"],
+            "range": ev["range"],
+            "issues": ev["issues"],
+            "blocked": ev["blocked"],
+            "blocker_types": ev["blocker_types"],
+            "points": [enrich(p) for p in ev["points"]],
+            "excluded_points": [enrich(p) for p in ev["excluded_points"]],
+            "samples": [enrich(s) for s in ev["samples"]],
+            "lanes": [
+                {"id": l["id"], "x0": l["x0"], "x1": l["x1"], "label": l["label"]}
+                for l in bundle["lanes"]],
+        }
+        return snap
+
+    @app.post("/api/calibrations/<int:cal_id>/fit")
+    def fit_calibration(cal_id):
+        """保存当前模型为新版本。阻断性问题或未填排除理由时拒绝(不形成含量结论)。"""
+        p = request.get_json(force=True) or {}
+        model = p.get("model", "linear")
+        if model not in calibration.MODELS:
+            abort(400, "未知模型")
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            data2, clean, _, removed = _check_lane_payload(c, cal["analysis_id"], cal_id, p)
+            if data2["bundle"] is None:
+                abort(400, "该板尚未完成几何标定,不能成线")
+            live_ids = {l["id"] for l in data2["bundle"]["lanes"]}
+            # 排除理由与阻断问题在实时状态上复核
+            db.replace_cal_lanes(c, cal_id, clean, live_lane_ids=live_ids,
+                                 remove_lane_ids=removed)
+            db.update_calibration(c, cal_id, {"model": model})
+            st = calibration_state(c, cal_id)
+            ev = st["evaluation"]
+            missing_reason = [i for i in ev["issues"]
+                              if i["type"] == "exclude_reason_required"]
+            if missing_reason:
+                abort(400, "排除标准点必须填写理由")
+            if ev["blocked"]:
+                abort(400, "校准存在阻断性问题,不能成线:" +
+                      ";".join(i["message"] for i in ev["issues"]
+                               if i["level"] == "error" and i["type"] in calibration.BLOCKERS))
+            data = cal_plate_data(c, cal["analysis_id"])
+            snap = _build_snapshot(db.get_calibration(c, cal_id), data, ev)
+            vid, ver = db.add_cal_version(c, cal_id, model, ev["fit"], snap,
+                                          data["fingerprint"])
+            return jsonify({"version_id": vid, "version": ver,
+                            "state": calibration_state(c, cal_id)})
+
+    @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>")
+    def get_cal_version(cal_id, vid):
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            v = db.get_cal_version(c, vid)
+            if not v or v["calibration_id"] != cal_id:
+                abort(404, "版本不存在")
+            data = cal_plate_data(c, cal["analysis_id"])
+            return jsonify({"version": {k: v[k] for k in
+                                        ("id", "version", "model", "fit", "source_fp",
+                                         "is_current", "created_at")},
+                            "snapshot": v["snapshot"],
+                            "stale": v["source_fp"] != data["fingerprint"],
+                            "current_fp": data["fingerprint"]})
+
+    @app.post("/api/calibrations/<int:cal_id>/delete")
+    def delete_calibration(cal_id):
+        with con() as c:
+            cal = db.get_calibration(c, cal_id)
+            if not cal:
+                abort(404, "校准不存在")
+            aid = cal["analysis_id"]
+            db.delete_calibration(c, cal_id)
+            return jsonify({"ok": True, "analysis_id": aid,
+                            "calibrations": db.list_calibrations(c, aid)})
+
+    def _version_or_400(c, cal_id, vid):
+        cal = db.get_calibration(c, cal_id)
+        if not cal:
+            abort(404, "校准不存在")
+        v = db.get_cal_version(c, vid)
+        if not v or v["calibration_id"] != cal_id:
+            abort(404, "版本不存在")
+        data = cal_plate_data(c, cal["analysis_id"])
+        stale = v["source_fp"] != data["fingerprint"]
+        return cal, v, v["snapshot"], stale
+
+    @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/samples.csv")
+    def export_cal_samples_csv(cal_id, vid):
+        with con() as c:
+            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
+            fit = v["fit"]
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["calibration_id", "calibration_name", "version", "model",
+                        "stale", "analysis_id", "analysis_name", "geometry_version",
+                        "target", "lane_id", "lane_label", "spot_no", "peak_id", "rf",
+                        "response_area", "injection_volume", "dilution",
+                        "back_amount", "applied_concentration", "sample_concentration",
+                        "conc_unit", "in_range", "status", "reasons"])
+            for s in snap["samples"]:
+                w.writerow([
+                    cal_id, cal["name"], v["version"], v["model"],
+                    1 if stale else 0, cal["analysis_id"], snap["analysis_name"],
+                    snap["geometry_version"], cal["target_name"],
+                    s["lane_id"], s["lane_label"], s.get("spot_no", ""),
+                    s.get("peak_id", ""),
+                    "" if s.get("rf") is None else f"{s['rf']:.4f}",
+                    f"{s['response']:.2f}" if s.get("response") is not None else "",
+                    s.get("volume", ""), s.get("dilution", ""),
+                    "" if s.get("amount_back") is None else f"{s['amount_back']:.6g}",
+                    "" if s.get("applied_concentration") is None
+                    else f"{s['applied_concentration']:.6g}",
+                    "" if s.get("sample_concentration") is None
+                    else f"{s['sample_concentration']:.6g}",
+                    cal["conc_unit"],
+                    "" if s.get("in_range") is None else (1 if s["in_range"] else 0),
+                    s["status"], ";".join(s.get("reasons", []))])
+            mem = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+            mem.seek(0)
+            tag = "_EXPIRED" if stale else ""
+            return send_file(mem, mimetype="text/csv", as_attachment=True,
+                             download_name=f"cal{cal_id}_v{v['version']}_samples{tag}.csv")
+
+    @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/model.json")
+    def export_cal_model_json(cal_id, vid):
+        with con() as c:
+            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
+            payload = {
+                "tool": TOOL, "tool_version": __version__,
+                "exported_at": db.now(),
+                "calibration_id": cal_id, "name": cal["name"],
+                "analysis_id": cal["analysis_id"],
+                "version": v["version"], "version_id": v["id"],
+                "model": v["model"], "fit": v["fit"],
+                "source_fingerprint": v["source_fp"], "stale": stale,
+                "snapshot": snap}
+            mem = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+            mem.seek(0)
+            tag = "_EXPIRED" if stale else ""
+            return send_file(mem, mimetype="application/json", as_attachment=True,
+                             download_name=f"cal{cal_id}_v{v['version']}_model{tag}.json")
+
+    @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/figure.png")
+    def export_cal_figure(cal_id, vid):
+        with con() as c:
+            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
+            ev = {
+                "model": v["model"], "fit": v["fit"], "range": snap["range"],
+                "points": snap["points"], "excluded_points": snap["excluded_points"],
+                "samples": snap["samples"], "issues": snap["issues"],
+                "blocked": snap["blocked"], "blocker_types": snap["blocker_types"]}
+            meta = {"calibration_name": cal["name"], "analysis_id": cal["analysis_id"],
+                    "analysis_name": snap["analysis_name"], "version": v["version"],
+                    "target_name": cal["target_name"], "conc_unit": cal["conc_unit"],
+                    "vol_unit": cal["vol_unit"], "created_at": v["created_at"]}
+            img = calibration.draw_calibration(ev, meta, stale=stale)
+            path = os.path.join(exports, f"cal{cal_id}_v{v['version']}_calibration.png")
             img.save(path)
             return send_file(path, mimetype="image/png",
                              as_attachment=request.args.get("dl") == "1",

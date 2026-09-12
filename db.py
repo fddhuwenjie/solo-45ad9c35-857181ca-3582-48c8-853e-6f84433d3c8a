@@ -88,6 +88,44 @@ CREATE TABLE IF NOT EXISTS comparison_matches (
   updated_at TEXT NOT NULL,
   UNIQUE(target_id, member_id)
 );
+CREATE TABLE IF NOT EXISTS calibrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analysis_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  target_name TEXT NOT NULL DEFAULT '',
+  target_rf REAL,
+  rf_tol REAL NOT NULL DEFAULT 0.08,
+  conc_unit TEXT NOT NULL DEFAULT 'ng/uL',
+  vol_unit TEXT NOT NULL DEFAULT 'uL',
+  model TEXT NOT NULL DEFAULT 'linear',
+  current_version INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calibration_lanes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calibration_id INTEGER NOT NULL,
+  lane_id INTEGER NOT NULL,            -- 单板 lanes.id(当前几何版本)
+  role TEXT NOT NULL DEFAULT 'unknown',-- standard | blank | unknown
+  peak_id INTEGER,                     -- 绑定斑点(峰 id);空白可为空
+  concentration REAL,                  -- 标准点样液浓度(标准用)
+  volume REAL,                         -- 进样体积(标准/未知用)
+  dilution REAL,                       -- 稀释倍数(未知用)
+  excluded INTEGER NOT NULL DEFAULT 0, -- 标准点排除
+  exclude_reason TEXT NOT NULL DEFAULT '',
+  sort REAL NOT NULL DEFAULT 0,
+  UNIQUE(calibration_id, lane_id)
+);
+CREATE TABLE IF NOT EXISTS calibration_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calibration_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  fit TEXT NOT NULL,                   -- 拟合结果 {slope,intercept,r2}
+  snapshot TEXT NOT NULL,              -- 成线时完整快照(几何/边界/斑点ID/面积/标注/反算)
+  source_fp TEXT NOT NULL,             -- 来源数据指纹;与当前不符即过期
+  is_current INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -112,7 +150,6 @@ def init_db(db_path):
         if "data_fp" not in cols:
             con.execute("ALTER TABLE comparison_matches"
                         " ADD COLUMN data_fp TEXT NOT NULL DEFAULT ''")
-
 
 def row_to_dict(r):
     return {k: r[k] for k in r.keys()}
@@ -352,3 +389,141 @@ def set_match_lock(con, target_id, member_id, locked):
         "UPDATE comparison_matches SET locked=?, updated_at=?"
         " WHERE target_id=? AND member_id=?",
         (1 if locked else 0, now(), target_id, member_id))
+
+
+# ---------- 校准曲线 ----------
+
+def create_calibration(con, analysis_id, name, target_name, target_rf, rf_tol,
+                       conc_unit, vol_unit):
+    cur = con.execute(
+        """INSERT INTO calibrations
+           (analysis_id, name, target_name, target_rf, rf_tol, conc_unit, vol_unit,
+            model, current_version, created_at)
+           VALUES (?,?,?,?,?,?,?,?,NULL,?)""",
+        (analysis_id, name, target_name, target_rf, rf_tol, conc_unit, vol_unit,
+         "linear", now()))
+    return cur.lastrowid
+
+
+def get_calibration(con, cal_id):
+    r = con.execute("SELECT * FROM calibrations WHERE id=?", (cal_id,)).fetchone()
+    return row_to_dict(r) if r else None
+
+
+def list_calibrations(con, analysis_id):
+    rows = con.execute(
+        """SELECT ca.*,
+                  (SELECT COUNT(*) FROM calibration_lanes cl
+                   WHERE cl.calibration_id=ca.id AND cl.role='standard') AS n_standard,
+                  (SELECT COUNT(*) FROM calibration_versions cv
+                   WHERE cv.calibration_id=ca.id) AS n_version
+           FROM calibrations ca WHERE analysis_id=? ORDER BY ca.id DESC""",
+        (analysis_id,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def update_calibration(con, cal_id, fields):
+    """更新名称/目标/单位/模型(模型也可由 fit 切换)。fields 中 None 键跳过。"""
+    allowed = ("name", "target_name", "target_rf", "rf_tol", "conc_unit", "vol_unit", "model")
+    sets, vals = [], []
+    for k in allowed:
+        if k in fields and fields[k] is not None:
+            sets.append(f"{k}=?")
+            vals.append(fields[k])
+    if sets:
+        vals.append(cal_id)
+        con.execute(f"UPDATE calibrations SET {', '.join(sets)} WHERE id=?", vals)
+
+
+def delete_calibration(con, cal_id):
+    con.execute("DELETE FROM calibration_versions WHERE calibration_id=?", (cal_id,))
+    con.execute("DELETE FROM calibration_lanes WHERE calibration_id=?", (cal_id,))
+    con.execute("DELETE FROM calibrations WHERE id=?", (cal_id,))
+
+
+def list_cal_lanes(con, cal_id):
+    rows = con.execute(
+        "SELECT * FROM calibration_lanes WHERE calibration_id=? ORDER BY sort, id",
+        (cal_id,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def replace_cal_lanes(con, cal_id, lanes, live_lane_ids=None, remove_lane_ids=()):
+    """全量替换标注泳道(role/绑定/浓度/体积/稀释/排除)。
+
+    live_lane_ids:当前几何版本存在的泳道 id。未在提交列表中的活泳道删除标注;
+    已失效的旧泳道(不在此集合)默认保留,供来源追溯,除非其 id 出现在
+    remove_lane_ids(用户显式清除失效标注)。
+    """
+    rows = con.execute(
+        "SELECT id, lane_id FROM calibration_lanes WHERE calibration_id=?",
+        (cal_id,)).fetchall()
+    new_ids = {l["lane_id"] for l in lanes}
+    forced = set(remove_lane_ids or ())
+    existing = set()
+    for r in rows:
+        lid = r["lane_id"]
+        if lid in new_ids:
+            existing.add(lid)
+            continue
+        if lid in forced or live_lane_ids is None or lid in live_lane_ids:
+            con.execute("DELETE FROM calibration_lanes WHERE id=?", (r["id"],))
+    for i, l in enumerate(lanes):
+        if l["lane_id"] in existing:
+            con.execute(
+                """UPDATE calibration_lanes SET role=?, peak_id=?, concentration=?, volume=?,
+                   dilution=?, excluded=?, exclude_reason=?, sort=?
+                   WHERE calibration_id=? AND lane_id=?""",
+                (l["role"], l.get("peak_id"), l.get("concentration"), l.get("volume"),
+                 l.get("dilution"), 1 if l.get("excluded") else 0,
+                 l.get("exclude_reason", ""), i, cal_id, l["lane_id"]))
+        else:
+            con.execute(
+                """INSERT INTO calibration_lanes
+                   (calibration_id, lane_id, role, peak_id, concentration, volume, dilution,
+                    excluded, exclude_reason, sort)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (cal_id, l["lane_id"], l["role"], l.get("peak_id"),
+                 l.get("concentration"), l.get("volume"), l.get("dilution"),
+                 1 if l.get("excluded") else 0, l.get("exclude_reason", ""), i))
+
+
+def get_cal_version(con, vid):
+    r = con.execute("SELECT * FROM calibration_versions WHERE id=?", (vid,)).fetchone()
+    if not r:
+        return None
+    d = row_to_dict(r)
+    d["fit"] = json.loads(d["fit"])
+    d["snapshot"] = json.loads(d["snapshot"])
+    return d
+
+
+def list_cal_versions(con, cal_id):
+    rows = con.execute(
+        "SELECT id, calibration_id, version, model, fit, source_fp, is_current, created_at"
+        " FROM calibration_versions WHERE calibration_id=? ORDER BY version", (cal_id,)).fetchall()
+    out = []
+    for r in rows:
+        d = row_to_dict(r)
+        d["fit"] = json.loads(d["fit"])
+        out.append(d)
+    return out
+
+
+def add_cal_version(con, cal_id, model, fit, snapshot, source_fp):
+    """旧版本失效(is_current=0),写入新版本并把 calibrations.current_version 指过去。"""
+    old = con.execute(
+        "SELECT MAX(version) AS v FROM calibration_versions WHERE calibration_id=?",
+        (cal_id,)).fetchone()
+    version = (old["v"] or 0) + 1
+    con.execute("UPDATE calibration_versions SET is_current=0 WHERE calibration_id=?", (cal_id,))
+    cur = con.execute(
+        """INSERT INTO calibration_versions
+           (calibration_id, version, model, fit, snapshot, source_fp, is_current, created_at)
+           VALUES (?,?,?,?,?,?,1,?)""",
+        (cal_id, version, model, json.dumps(fit), json.dumps(snapshot, ensure_ascii=False),
+         source_fp, now()))
+    vid = cur.lastrowid
+    con.execute("UPDATE calibrations SET current_version=?, model=? WHERE id=?",
+                (vid, model, cal_id))
+    return vid, version
