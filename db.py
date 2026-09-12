@@ -1,4 +1,4 @@
-"""SQLite 持久化:分析、几何版本(含调整前后留痕)、泳道、峰、异常处置。"""
+"""SQLite 持久化:分析、几何版本(含调整前后留痕)、泳道、峰、异常处置、跨板对照。"""
 
 import json
 import os
@@ -52,6 +52,40 @@ CREATE TABLE IF NOT EXISTS flag_decisions (
   reason TEXT NOT NULL DEFAULT '',
   decided_at TEXT NOT NULL,
   UNIQUE(analysis_id, geometry_version, flag_key)
+);
+CREATE TABLE IF NOT EXISTS comparisons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comparison_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comparison_id INTEGER NOT NULL,
+  analysis_id INTEGER NOT NULL,
+  std_lane_id INTEGER NOT NULL,        -- 该板的标准品泳道
+  position INTEGER NOT NULL DEFAULT 0, -- 并排顺序
+  fingerprint TEXT NOT NULL DEFAULT '',-- 加入/最近确认时板数据指纹(几何版本+泳道+峰边界)
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comparison_targets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comparison_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  rf_ref REAL NOT NULL,                -- 参考 Rf
+  rf_tol REAL NOT NULL DEFAULT 0.05,   -- 候选匹配容差
+  sort REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS comparison_matches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comparison_id INTEGER NOT NULL,
+  target_id INTEGER NOT NULL,
+  member_id INTEGER NOT NULL,
+  peak_id INTEGER,                     -- NULL = 已拆开(无匹配)
+  lane_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'auto', -- auto=程序建议 | manual=用户改绑/拆开
+  locked INTEGER NOT NULL DEFAULT 0,   -- 1=锁定确认,重配不再改动
+  updated_at TEXT NOT NULL,
+  UNIQUE(target_id, member_id)
 );
 """
 
@@ -196,3 +230,115 @@ def set_decision(con, aid, version, flag_key, kept, reason):
            ON CONFLICT(analysis_id, geometry_version, flag_key)
            DO UPDATE SET kept=excluded.kept, reason=excluded.reason, decided_at=excluded.decided_at""",
         (aid, version, flag_key, 1 if kept else 0, reason, now()))
+
+
+# ---------- 跨板对照 ----------
+
+def create_comparison(con, name):
+    cur = con.execute("INSERT INTO comparisons (name, created_at) VALUES (?,?)",
+                      (name, now()))
+    return cur.lastrowid
+
+
+def list_comparisons(con):
+    rows = con.execute(
+        """SELECT c.*, (SELECT COUNT(*) FROM comparison_members m WHERE m.comparison_id=c.id) AS n_members,
+                  (SELECT COUNT(*) FROM comparison_targets t WHERE t.comparison_id=c.id) AS n_targets
+           FROM comparisons c ORDER BY c.id DESC""").fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def get_comparison(con, cid):
+    r = con.execute("SELECT * FROM comparisons WHERE id=?", (cid,)).fetchone()
+    return row_to_dict(r) if r else None
+
+
+def add_member(con, cid, analysis_id, std_lane_id, fingerprint):
+    pos = con.execute(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM comparison_members WHERE comparison_id=?",
+        (cid,)).fetchone()[0]
+    cur = con.execute(
+        """INSERT INTO comparison_members
+           (comparison_id, analysis_id, std_lane_id, position, fingerprint, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (cid, analysis_id, std_lane_id, pos, fingerprint, now()))
+    return cur.lastrowid
+
+
+def get_member(con, mid):
+    r = con.execute("SELECT * FROM comparison_members WHERE id=?", (mid,)).fetchone()
+    return row_to_dict(r) if r else None
+
+
+def list_members(con, cid):
+    rows = con.execute(
+        "SELECT * FROM comparison_members WHERE comparison_id=? ORDER BY position, id",
+        (cid,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def update_member(con, mid, std_lane_id=None, fingerprint=None):
+    if std_lane_id is not None:
+        con.execute("UPDATE comparison_members SET std_lane_id=? WHERE id=?",
+                    (std_lane_id, mid))
+    if fingerprint is not None:
+        con.execute("UPDATE comparison_members SET fingerprint=? WHERE id=?",
+                    (fingerprint, mid))
+
+
+def delete_member(con, mid):
+    con.execute("DELETE FROM comparison_matches WHERE member_id=?", (mid,))
+    con.execute("DELETE FROM comparison_members WHERE id=?", (mid,))
+
+
+def add_target(con, cid, name, rf_ref, rf_tol):
+    pos = con.execute(
+        "SELECT COALESCE(MAX(sort), -1) + 1 FROM comparison_targets WHERE comparison_id=?",
+        (cid,)).fetchone()[0]
+    cur = con.execute(
+        "INSERT INTO comparison_targets (comparison_id, name, rf_ref, rf_tol, sort)"
+        " VALUES (?,?,?,?,?)",
+        (cid, name, rf_ref, rf_tol, pos))
+    return cur.lastrowid
+
+
+def update_target(con, tid, name, rf_ref, rf_tol):
+    con.execute("UPDATE comparison_targets SET name=?, rf_ref=?, rf_tol=? WHERE id=?",
+                (name, rf_ref, rf_tol, tid))
+
+
+def delete_target(con, tid):
+    con.execute("DELETE FROM comparison_matches WHERE target_id=?", (tid,))
+    con.execute("DELETE FROM comparison_targets WHERE id=?", (tid,))
+
+
+def list_targets(con, cid):
+    rows = con.execute(
+        "SELECT * FROM comparison_targets WHERE comparison_id=? ORDER BY sort, id",
+        (cid,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def list_matches(con, cid):
+    rows = con.execute(
+        "SELECT * FROM comparison_matches WHERE comparison_id=?", (cid,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def upsert_match(con, cid, target_id, member_id, peak_id, lane_id, status, locked):
+    con.execute(
+        """INSERT INTO comparison_matches
+           (comparison_id, target_id, member_id, peak_id, lane_id, status, locked, updated_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(target_id, member_id)
+           DO UPDATE SET peak_id=excluded.peak_id, lane_id=excluded.lane_id,
+                         status=excluded.status, locked=excluded.locked,
+                         updated_at=excluded.updated_at""",
+        (cid, target_id, member_id, peak_id, lane_id, status, 1 if locked else 0, now()))
+
+
+def set_match_lock(con, target_id, member_id, locked):
+    con.execute(
+        "UPDATE comparison_matches SET locked=?, updated_at=?"
+        " WHERE target_id=? AND member_id=?",
+        (1 if locked else 0, now(), target_id, member_id))

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跨板对照 — TLC 图像定量</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>跨板对照</h1>
+  <div class="hdr-group">
+    <select id="cmpSelect" title="打开已有对照组"></select>
+    <input type="text" id="cmpName" placeholder="新对照组名称" size="12">
+    <button id="btnNewCmp">新建</button>
+    <a class="btn" href="/">单板定量</a>
+  </div>
+  <div class="hdr-group" id="cmpExports" hidden>
+    <span id="cmpBadge" class="badge"></span>
+    <a id="expCsv" class="btn" href="#" target="_blank">跨板 CSV</a>
+    <a id="expJson" class="btn" href="#" target="_blank">匹配关系 JSON</a>
+    <a id="expFig" class="btn" href="#" target="_blank">对照图</a>
+  </div>
+</header>
+
+<div id="emptyState">
+  <p>新建或选择一个对照组:从已完成定量的板中加入成员,指定共同标准品泳道与待比较的目标斑点,<br>
+     程序按 Rf 容差 + 峰形 + 标准品次序给出候选,并用标准品响应求各板归一化系数。</p>
+</div>
+
+<main id="workspace" hidden>
+  <section id="stage">
+    <div id="hint"></div>
+    <div id="stripWrap"><canvas id="stripCv"></canvas></div>
+    <div id="profileRow"></div>
+    <div class="panel">
+      <h3>匹配关系 <span class="dim">点击单元格改绑候选 / 拆开误配 / 锁定确认</span></h3>
+      <table id="matchTable"></table>
+    </div>
+    <div class="panel">
+      <h3>跨板汇总</h3>
+      <div id="summaryBody"></div>
+      <div id="excludedBody"></div>
+    </div>
+  </section>
+
+  <aside id="sidebar">
+    <div class="panel">
+      <h3>成员板</h3>
+      <ul id="memberList" class="itemlist tall"></ul>
+      <div class="row wrap">
+        <select id="addAnalysis"></select>
+        <select id="addStdLane"></select>
+        <button id="btnAddMember" class="primary">加入</button>
+      </div>
+      <div class="kv" id="addHint"></div>
+    </div>
+
+    <div class="panel">
+      <h3>目标斑点</h3>
+      <ul id="targetList" class="itemlist"></ul>
+      <div class="row wrap">
+        <input type="text" id="tName" placeholder="名称" size="7">
+        <input type="number" id="tRf" placeholder="参考Rf" step="0.01" min="0" max="1" style="width:76px">
+        <input type="number" id="tTol" placeholder="容差" step="0.01" min="0.01" max="0.5" value="0.05" style="width:64px">
+        <button id="btnAddTarget" class="primary">添加</button>
+        <button id="btnCancelEdit" hidden>取消</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>判定阈值</h3>
+      <div class="kv" id="thresholds"></div>
+    </div>
+  </aside>
+</main>
+
+<script src="{{ url_for('static', filename='compare.js') }}"></script>
+</body>
+</html>

@@ -44,7 +44,13 @@ def add_spot(img, x, y, amp, sx, sy_up, sy_down=None):
             px[i, j] = 0 if nv < 0 else int(nv)
 
 
-def build_plate():
+def build_plate(amp_scale=1.0, std_size_scale=1.0):
+    """构建板面图像。
+
+    amp_scale:      按比例缩放全部斑点显色强度(模拟板间显色差异)。
+    std_size_scale: 按比例缩放泳道 1(标准品泳道)斑点尺寸,面积随之变化
+                    (模拟标准品点样量差异,峰高基本不变,仍可稳定检出)。
+    """
     # 照明梯度:左上亮右下暗
     gx = Image.linear_gradient("L").rotate(90, expand=True).resize((PLATE_W, PLATE_H))
     gy = Image.linear_gradient("L").resize((PLATE_W, PLATE_H))
@@ -62,20 +68,21 @@ def build_plate():
         ln = 16 if k % 5 == 0 else 9
         d.line([(0, y), (ln, y)], fill=90, width=2)
 
-    # 泳道 1:三个正常斑点
-    add_spot(illum, LANES_X[0], rf_to_y(0.20), 70, 11, 9)
-    add_spot(illum, LANES_X[0], rf_to_y(0.50), 100, 12, 10)
-    add_spot(illum, LANES_X[0], rf_to_y(0.80), 55, 10, 8)
+    ss = std_size_scale
+    # 泳道 1:三个正常斑点(标准品泳道,尺寸可独立缩放)
+    add_spot(illum, LANES_X[0], rf_to_y(0.20), 70 * amp_scale, 11 * ss, 9 * ss)
+    add_spot(illum, LANES_X[0], rf_to_y(0.50), 100 * amp_scale, 12 * ss, 10 * ss)
+    add_spot(illum, LANES_X[0], rf_to_y(0.80), 55 * amp_scale, 10 * ss, 8 * ss)
     # 泳道 2:拖尾斑点(向基线方向拉长)+ 一个正常斑点
-    add_spot(illum, LANES_X[1], rf_to_y(0.35), 95, 11, 7, sy_down=30)
-    add_spot(illum, LANES_X[1], rf_to_y(0.70), 70, 11, 9)
+    add_spot(illum, LANES_X[1], rf_to_y(0.35), 95 * amp_scale, 11, 7, sy_down=30)
+    add_spot(illum, LANES_X[1], rf_to_y(0.70), 70 * amp_scale, 11, 9)
     # 泳道 3:共洗脱双峰 + 一个正常斑点
-    add_spot(illum, LANES_X[2], rf_to_y(0.45), 80, 12, 11)
-    add_spot(illum, LANES_X[2], rf_to_y(0.50), 75, 12, 11)
-    add_spot(illum, LANES_X[2], rf_to_y(0.75), 60, 10, 8)
+    add_spot(illum, LANES_X[2], rf_to_y(0.45), 80 * amp_scale, 12, 11)
+    add_spot(illum, LANES_X[2], rf_to_y(0.50), 75 * amp_scale, 12, 11)
+    add_spot(illum, LANES_X[2], rf_to_y(0.75), 60 * amp_scale, 10, 8)
     # 泳道 4:过浓饱和斑点(中心截断到 0)+ 弱斑点
-    add_spot(illum, LANES_X[3], rf_to_y(0.50), 400, 13, 12)
-    add_spot(illum, LANES_X[3], rf_to_y(0.25), 20, 9, 8)
+    add_spot(illum, LANES_X[3], rf_to_y(0.50), 400 * amp_scale, 13, 12)
+    add_spot(illum, LANES_X[3], rf_to_y(0.25), 20 * amp_scale, 9, 8)
 
     noise = Image.effect_noise((PLATE_W, PLATE_H), 5)
     return Image.blend(illum, noise, 0.15)
