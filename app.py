@@ -1281,7 +1281,9 @@ def create_app(data_dir=None):
 
     def kinetic_state(c, sid):
         st = kin_compute(c, sid)
-        st["frames_out"] = [_kin_compact_frame(e) for e in st["frames"]]
+        # 内部 frames 含全长逐行密度曲线,仅供服务端计算;JSON 只下发降采样压缩帧
+        st["frames"] = [_kin_compact_frame(e) for e in st["frames"]]
+        st["frames_out"] = st["frames"]
         return st
 
     @app.get("/api/analyses/<int:aid>/kinetics")

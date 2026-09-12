@@ -106,3 +106,28 @@ td.cell select { max-width: 150px; font-size: 11px; padding: 2px; }
 .flag a { font-size: 12px; }
 dialog table { font-size: 11px; }
 dialog h4 { margin: 12px 0 4px; font-size: 13px; }
+
+/* ---- 显色时间序列 ---- */
+#overlayWrap, #densityWrap, #responseWrap, #regWrap {
+  background: #14161a; border: 1px solid var(--line); border-radius: 8px; overflow: auto;
+}
+#overlayCv { width: auto; max-width: 100%; }
+#timeSlider { accent-color: var(--accent); }
+#frameTicks span {
+  flex: 1 1 0; text-align: center; font-size: 10px; color: var(--dim);
+  border-top: 2px solid var(--line); padding-top: 1px; cursor: pointer; min-width: 30px;
+}
+#frameTicks span.cur { border-top-color: var(--accent); color: var(--accent); }
+#frameTicks span.excluded { opacity: .45; border-top-color: var(--dim); text-decoration: line-through; }
+#frameTicks span.bad { border-top-color: var(--err); color: var(--err); }
+#lanePick button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+#frameTable tr.selected td { background: #2d3a4d; }
+#frameTable td, #frameTable th { white-space: nowrap; }
+#frameTable input[type=text] { width: 120px; }
+#blockerBody .flag { margin: 4px 0; }
+#blockerBody a { color: var(--accent); cursor: pointer; }
+#blockerBody .seq-ok { color: #5c6; }
+#windowStats table { margin-top: 6px; }
+#regCv { width: auto; max-width: 100%; cursor: crosshair; display: block; }
+#regWrap { max-height: 80vh; }
+.chkpt-mark { color: var(--warn); }

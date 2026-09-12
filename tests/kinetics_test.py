@@ -137,6 +137,10 @@ W, H = 700, 520
 BASE_Y, FRONT_Y = 460.0, 60.0
 LANE_X = [70, 150, 230, 310]
 SPOT_RF = [0.22, 0.66]
+# 板面四角在帧画布内留边(模拟真实照片板外有背景),帧间平移后四角仍在画面内可精确配准
+INSET = 22
+REF_CORNERS = [[INSET, INSET], [W - 1 - INSET, INSET],
+               [W - 1 - INSET, H - 1 - INSET], [INSET, H - 1 - INSET]]
 
 
 def spot_y(rf):
@@ -173,22 +177,18 @@ def make_frame(amp_fn, shift=(0, 0), saturated=False):
 
 
 def frame_corners(shift):
-    """合成帧板面四角(帧像素) -> 校正参考矩形的控制点对输入。
-
-    参考板四角 (0,0),(W-1,H-1) 透视矫正后派生尺寸为 (W-1)×(H-1),
-    即校正空间有效坐标到 W-2/H-2;帧画布同样 0..W-1。
-    """
+    """帧板面四角 = 参考板四角平移(帧像素) -> 校正空间矩形四角(控制点对)。"""
     ox, oy = shift
-    src = [[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]]
-    ref = [[0, 0], [W - 2, 0], [W - 2, H - 2], [0, H - 2]]
-    return [{"fx": min(W - 1, sx + ox), "fy": min(H - 1, sy + oy),
-             "rx": float(rx), "ry": float(ry), "kind": "corner"}
-            for (sx, sy), (rx, ry) in zip(src, ref)]
+    dW, dH = W - 1 - 2 * INSET, H - 1 - 2 * INSET
+    ref = [[0, 0], [dW, 0], [dW, dH], [0, dH]]
+    return [{"fx": cx + ox, "fy": cy + oy, "rx": float(rx), "ry": float(ry),
+             "kind": "corner"}
+            for (cx, cy), (rx, ry) in zip(REF_CORNERS, ref)]
 
 
 def amp_profile(t):
-    """显色动力学:10s 弱、30/40/50s 平台、60s 衰减(相对幅度因子)。"""
-    table = {0: 0.25, 1: 0.97, 2: 1.0, 3: 0.99, 4: 0.6, 5: 0.3}
+    """显色动力学:10s 弱、30/40/50s 平台(均在峰值 ±6% 内)、60s 后衰减。"""
+    table = {0: 0.25, 1: 0.98, 2: 1.0, 3: 0.99, 4: 0.6, 5: 0.3}
     return table[t]
 
 
@@ -201,12 +201,12 @@ def upload_plate_image(c, img, name):
 
 
 def setup_base_plate(c):
-    """参考板 = 平台期(t=2,幅度 1.0),完成几何/泳道/峰。"""
+    """参考板 = 平台期(t=2,幅度 1.0),完成几何/泳道/峰。板面四角内缩留边。"""
     st = upload_plate_image(c, make_frame(lambda li, rf: 20.0 + 5 * li),
                             "动力学板")
     aid = st["analysis"]["id"]
     c.post(f"/api/analyses/{aid}/geometry", json={
-        "corners": [[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]],
+        "corners": REF_CORNERS,
         "baseline": [W / 2, BASE_Y], "front": [W / 2, FRONT_Y],
         "scale": {"p1": [5, BASE_Y], "p2": [5, FRONT_Y], "mm": 80.0}})
     half = 24
@@ -248,7 +248,7 @@ def e2e():
     sid = c.post(f"/api/analyses/{aid}/kinetics", json={
         "name": "批K显色序列", "start_at": "10:00:00"}).get_json()["series"]["id"]
     times = ["10:00:10", "10:00:30", "10:00:40", "10:00:50", "10:01:00", "10:01:10"]
-    SHIFT = (5, 3)
+    SHIFT = (12, 9)
     st = None
     for i, ta in enumerate(times):
         f = amp_profile(i)
@@ -426,18 +426,18 @@ def e2e():
     sat_img = make_frame(lambda li, rf: 999, saturated=True, shift=SHIFT)
     buf = io.BytesIO(); sat_img.save(buf, "PNG"); buf.seek(0)
     st_sat = c.post(f"/api/kinetics/{sid}/frames",
-                    data={"file": (buf, "sat.png"), "taken_at": "10:00:45"},
+                    data={"file": (buf, "sat.png"), "taken_at": "10:01:15"},
                     content_type="multipart/form-data").get_json()
     sat_id = st_sat["frames_out"][-1]["id"]
     st_sat = c.post(f"/api/kinetics/frames/{sat_id}",
                     json={"control_points": frame_corners(SHIFT)}).get_json()
     assert any(i["kind"] == "saturated" for i in st_sat["issues"])
-    r = c.post(f"/api/kinetics/{sid}/confirm", json={"t0": 30, "t1": 50})
+    # 饱和帧在 75s,超出 [30,50] 窗口本不影响;把窗口扩到 75s 以触发窗口内饱和阻断
+    r = c.post(f"/api/kinetics/{sid}/confirm", json={"t0": 30, "t1": 75})
     assert r.status_code == 400 and "饱和" in r.get_json()["description"]
-    # 排除饱和帧(带理由)后可确认
+    # 排除饱和帧(带理由)后,原平台窗口可重新确认(得到新版本)
     c.post(f"/api/kinetics/frames/{sat_id}",
            json={"excluded": True, "exclude_reason": "像素饱和,面积截断"})
-    # 重新确认会得到新版本
     st = c.get(f"/api/kinetics/{sid}").get_json()
     r = c.post(f"/api/kinetics/{sid}/confirm", json={"t0": 30, "t1": 50})
     assert r.status_code == 200, r.get_json().get("description", "")

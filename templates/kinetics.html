@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>显色时间序列校审 — TLC 图像定量</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>显色时间序列校审</h1>
+  <div class="hdr-group">
+    <select id="kinAnalysis" title="选择已标定几何的板"></select>
+    <select id="kinSelect" title="打开已有序列"></select>
+    <a class="btn" href="/">单板定量</a>
+    <a class="btn" href="/compare">跨板对照</a>
+    <a class="btn" href="/calibration">校准曲线</a>
+  </div>
+  <div class="hdr-group" id="kinExports" hidden>
+    <span id="kinBadge" class="badge"></span>
+    <a id="expFrames" class="btn" href="#" target="_blank">逐帧 CSV</a>
+    <a id="expRecompute" class="btn" href="#" target="_blank">复算 JSON</a>
+    <a id="expFig" class="btn" href="#" target="_blank">动力学图</a>
+  </div>
+</header>
+
+<div id="emptyState">
+  <p>同一块板喷显色剂后在不同时刻拍摄多张照片。把它们编成同一序列、登记显色开始与各帧拍摄时刻,<br>
+     用控制点把每帧对齐到已标定的板面校正空间;时间滑块联动叠加图、泳道密度曲线与逐斑点响应曲线。<br>
+     程序在冻结的泳道与积分边界上逐帧重算面积,识别上升 / 稳定平台 / 峰值 / 衰减区间。<br>
+     时刻重复倒序、配准残差超限、像素饱和、斑点漂出积分区或有效帧不足时只定位照片与斑点,不能确认取值窗口。</p>
+  <div class="newCal" style="margin-top:24px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap">
+    <select id="newAnalysis" title="选择已标定几何/积分边界的板"></select>
+    <input type="text" id="newName" placeholder="序列名称(如:批2026-09-A 显色)" size="22">
+    <label style="color:var(--dim)">显色开始
+      <input type="text" id="newStart" placeholder="HH:MM:SS(或留空按相对秒)" style="width:170px">
+    </label>
+    <button id="btnNew" class="primary">新建序列</button>
+  </div>
+  <p class="dim" style="margin-top:14px">帧时刻可用钟点(相对显色开始相减)或显色后秒数;留空显色开始时帧时刻按秒数登记。</p>
+</div>
+
+<main id="workspace" hidden>
+  <section id="stage">
+    <div id="hint"></div>
+
+    <div class="panel">
+      <h3>时间滑块 <span class="dim">拖动切换帧,叠加图 / 密度曲线 / 响应曲线联动;○排除帧 ✕配准失败</span></h3>
+      <div class="row wrap" style="margin:2px 0">
+        <input type="range" id="timeSlider" min="0" max="0" value="0" step="1" style="flex:1;min-width:260px">
+        <span id="frameClock" class="badge"></span>
+        <label style="color:var(--dim);font-size:12px"><input type="checkbox" id="chkOverlay"> 叠加参考板(半透明)</label>
+        <label style="color:var(--dim);font-size:12px"><input type="checkbox" id="chkRaw"> 响应曲线用原始面积</label>
+      </div>
+      <div id="frameTicks" style="display:flex;gap:2px;margin-top:2px"></div>
+    </div>
+
+    <div class="panel">
+      <h3>帧间叠加图 <span class="dim">当前帧配准到板面校正空间;框=冻结积分边界,圈=逐帧质心(红=漂移/饱和)</span></h3>
+      <div id="overlayWrap"><canvas id="overlayCv"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>泳道密度曲线 <span class="dim">实线=当前帧,虚线=参考板;阴影=积分边界;点击泳道/曲线或斑点选择</span></h3>
+      <div id="lanePick" class="row wrap" style="margin:2px 0"></div>
+      <div id="densityWrap"><canvas id="densityCv" height="260"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>逐斑点显色响应曲线 <span class="dim">●峰值,绿带=各斑点平台,蓝带=取值窗口;点击曲线定位斑点</span></h3>
+      <div id="responseWrap"><canvas id="responseCv" height="300"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>取值窗口</h3>
+      <div class="row wrap">
+        <label>窗口起 <input type="text" id="winT0" style="width:90px" placeholder="mm:ss 或秒"></label>
+        <label>窗口止 <input type="text" id="winT1" style="width:90px" placeholder="mm:ss 或秒"></label>
+        <button id="btnSuggest">采用建议平台窗口</button>
+        <button id="btnConfirm" class="primary">确认取值窗口(锁帧/配准/窗口)</button>
+      </div>
+      <div id="windowHint" class="warn"></div>
+      <div id="windowStats" class="kv"></div>
+    </div>
+
+    <div class="panel">
+      <h3>帧登记表 <span class="dim">逐帧拍摄时刻、配准残差、饱和/漂移状态;排除坏帧必须填写理由</span></h3>
+      <div style="overflow-x:auto">
+      <table id="frameTable">
+        <thead><tr>
+          <th>#</th><th>照片</th><th>拍摄时刻</th><th>显色秒</th><th>配准残差px</th>
+          <th>状态</th><th style="text-align:left">排除 / 理由</th><th>配准</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      </div>
+      <div class="row" style="margin-bottom:0">
+        <input type="file" id="frameFile" accept="image/*" hidden>
+        <input type="text" id="frameTaken" placeholder="本帧时刻 HH:MM:SS 或秒" style="width:180px">
+        <button id="btnAddFrame">添加帧照片…</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>已确认版本 <span class="dim">照片 / 板面几何 / 积分边界变化后旧版标为过期,下游校准只引用有效版本</span></h3>
+      <div id="versionBody"></div>
+    </div>
+  </section>
+
+  <aside id="sidebar">
+    <div class="panel">
+      <h3>序列设置</h3>
+      <div class="row wrap">
+        <label>名称<input type="text" id="fName" style="width:170px"></label>
+      </div>
+      <div class="row wrap">
+        <label>显色开始<input type="text" id="fStart" style="width:140px" placeholder="HH:MM:SS / 留空"></label>
+        <button id="btnSaveMeta">保存</button>
+        <button id="btnDelete">删除序列</button>
+      </div>
+      <div class="kv" id="metaHint"></div>
+    </div>
+
+    <div class="panel">
+      <h3>阻断项 / 定位</h3>
+      <div id="blockerBody" class="kv" style="white-space:normal"></div>
+    </div>
+
+    <div class="panel">
+      <h3>判定阈值</h3>
+      <div class="kv" id="thresholds"></div>
+    </div>
+  </aside>
+</main>
+
+<dialog id="regDialog">
+  <h3 style="margin:0 0 6px">控制点配准 · 帧 <span id="regTitle"></span></h3>
+  <div class="dim" style="font-size:12px;margin-bottom:6px">拖动照片四个板面角点到实际四角(红点);四角至少可解单应,残差超限请加检查点。下方 dx/dy 为校正空间微调平移。</div>
+  <div id="regWrap" style="background:#14161a;border-radius:6px;overflow:hidden"><canvas id="regCv"></canvas></div>
+  <div class="row wrap" style="margin:8px 0 4px">
+    <label>dx<input type="number" id="regDx" step="0.5" style="width:70px"></label>
+    <label>dy<input type="number" id="regDy" step="0.5" style="width:70px"></label>
+    <button id="btnAddCheck">+检查点</button>
+    <span id="regResid" class="dim" style="font-size:12px"></span>
+  </div>
+  <div class="row" style="margin-bottom:0">
+    <button id="regSave" class="primary">保存配准</button>
+    <button id="regCancel">取消</button>
+  </div>
+</dialog>
+
+<script src="{{ url_for('static', filename='kinetics.js') }}"></script>
+</body>
+</html>
