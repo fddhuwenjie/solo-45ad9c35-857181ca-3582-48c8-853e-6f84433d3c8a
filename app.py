@@ -16,7 +16,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_file, se
 from PIL import Image
 
 import db
-from tlc import TOOL, __version__, annotate, background, calibration, compare, geometry, pipeline, profile, qc
+from tlc import TOOL, __version__, annotate, background, calibration, compare, geometry, kinetics, pipeline, profile, qc
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_IMAGE = os.path.join(BASE_DIR, "sample", "sample_plate.png")
@@ -120,6 +120,10 @@ def create_app(data_dir=None):
     @app.get("/calibration")
     def calibration_page():
         return render_template("calibration.html")
+
+    @app.get("/kinetics")
+    def kinetics_page():
+        return render_template("kinetics.html")
 
     # ---------- 分析管理 ----------
 
@@ -1034,6 +1038,662 @@ def create_app(data_dir=None):
                              as_attachment=request.args.get("dl") == "1",
                              download_name=os.path.basename(path))
 
+    # ---------- 显色时间序列校审 ----------
+
+    def kin_default_controls(derived, fw=None, fh=None):
+        """新帧默认控制点:帧四角(帧图像素,fx/fy) -> 校正矩形四角(rx/ry)。
+
+        帧尺寸缺省时假设帧与校正图同尺寸;实际由上传帧的宽高决定。
+        """
+        W, H = derived["width"], derived["height"]
+        fw = W if fw is None else fw
+        fh = H if fh is None else fh
+        frame_rect = [(0.0, 0.0), (float(fw - 1), 0.0),
+                      (float(fw - 1), float(fh - 1)), (0.0, float(fh - 1))]
+        ref_rect = [(0.0, 0.0), (float(W - 1), 0.0),
+                    (float(W - 1), float(H - 1)), (0.0, float(H - 1))]
+        return [{"fx": fx, "fy": fy, "rx": rx, "ry": ry, "kind": "corner"}
+                for (fx, fy), (rx, ry) in zip(frame_rect, ref_rect)]
+
+    def kin_source_fingerprint(frames, series_row, plate):
+        """时间序列来源指纹:照片内容/尺寸 + 时刻 + 控制点 + 微调 + 排除 +
+        板面几何版本 + 泳道/积分边界指纹。任一变化 => 已成版快照过期。"""
+        payload = {
+            "image_sha1": plate["analysis"]["image_sha1"] if plate else "",
+            "plate_fp": plate["fingerprint"] if plate else "",
+            "geometry_version": plate["bundle"]["geometry_version"] if plate else None,
+            "start_at": series_row["start_at"],
+            "frames": [{
+                "id": f["id"], "seq": f["seq"], "sha1": f["image_sha1"],
+                "w": f["image_width"], "h": f["image_height"],
+                "taken_at": f["taken_at"], "cp": f["control_points"],
+                "dx": f["dx"], "dy": f["dy"],
+                "excluded": bool(f["excluded"]),
+                "exclude_reason": f["exclude_reason"],
+            } for f in sorted(frames, key=lambda f: (f["seq"], f["id"]))],
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def kin_compute(c, sid):
+        """组装序列并逐帧重算指标。返回 {series, frames:[{row, metrics, error}],
+        plate, times, issues, curves:{peak_id}, suggest, usable_ids, current_v?}。"""
+        srow = db.get_kinetic_series(c, sid)
+        if not srow:
+            abort(404, "时间序列不存在")
+        frames = db.list_kinetic_frames(c, sid)
+        # 单板当前几何/泳道/斑点(与校准、对照共用指纹缓存)
+        a, bundle = bundle_for(c, srow["analysis_id"])
+        if not a:
+            abort(404, "分析不存在")
+        plate = cal_plate_data(c, srow["analysis_id"]) if bundle else None
+        # 冻结泳道/峰(当前几何版本)
+        lanes_def = (bundle or {}).get("lanes", [])
+        derived = (bundle or {}).get("geometry", {}).get("derived")
+        ref_centers = {}
+        if plate:
+            ref_centers = {s["peak_id"]: s["center_y"] for s in plate["spots"]}
+
+        # 时刻
+        rows_for_time = [{"id": f["id"], "seq": f["seq"], "taken_at": f["taken_at"]}
+                         for f in frames]
+        trows, time_issues = kinetics.frame_times(rows_for_time, srow["start_at"] or None)
+        t_by_id = {r["frame_id"]: r["t_sec"] for r in trows}
+        out_frames = []
+        issues = list(time_issues)
+        lane_ids = [{"id": l["id"], "x0": l["x0"], "x1": l["x1"],
+                     "peaks": l["peaks"]} for l in lanes_def]
+        for f in frames:
+            entry = {"row": f, "t_sec": t_by_id.get(f["id"]),
+                     "metrics": None, "error": None}
+            if not bundle:
+                entry["error"] = {"kind": "no_geometry",
+                                  "message": "该板尚未完成几何标定"}
+                out_frames.append(entry)
+                continue
+            if f["excluded"]:
+                # 排除帧仍尝试配准/重算(供图上灰线),失败不报错
+                pass
+            cps = f["control_points"]
+            pairs_all = [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in cps]
+            corners = [p for p in cps if p.get("kind") == "corner"]
+            checks = [p for p in cps if p.get("kind") == "check"]
+            # 优先用四角 + 检查点;控制点不足 4 时用全部点
+            try:
+                if len(corners) == 4:
+                    pairs = [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in corners]
+                else:
+                    pairs = pairs_all
+                check_pairs = [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in checks]
+                m = kinetics.frame_metrics(
+                    f["image_path"], derived, lane_ids, pairs, check_pairs,
+                    f["dx"], f["dy"], residual_max=kinetics.DEFAULTS["reg_residual_max"],
+                    reference_centers=ref_centers)
+                entry["metrics"] = m
+                if len(pairs_all) < 4:
+                    entry["error"] = {"kind": "reg_insufficient",
+                                      "message": f"控制点仅 {len(pairs_all)} 个,不足 4 个"}
+            except kinetics.RegistrationError as e:
+                entry["error"] = {"kind": e.kind, "message": e.message}
+            except FileNotFoundError:
+                entry["error"] = {"kind": "image_missing", "message": "帧照片文件缺失"}
+            out_frames.append(entry)
+
+        usable = [e for e in out_frames
+                  if e["metrics"] is not None and e["error"] is None
+                  and not e["row"]["excluded"] and e["t_sec"] is not None]
+        # 逐斑点曲线
+        curves = {}
+        lane_label = {l["id"]: l["label"] for l in lanes_def}
+        if bundle:
+            for l in lanes_def:
+                for p in l["peaks"]:
+                    pid = p["id"]
+                    ts, vs = [], []
+                    per_spot_frames = []
+                    for e in usable:
+                        ps = next((s for s in e["metrics"]["spots"]
+                                   if s["peak_id"] == pid), None)
+                        if not ps:
+                            ts.append(None); vs.append(None); continue
+                        ts.append(e["t_sec"]); vs.append(ps["area"])
+                    an = kinetics.analyze_series(ts, vs)
+                    curves[pid] = {
+                        "peak_id": pid, "lane_id": l["id"],
+                        "lane_label": l.get("label", ""),
+                        "y0": p["y0"], "y1": p["y1"],
+                        "times": an["times"], "areas": an["areas"],
+                        "normalized": an["normalized"], "segments": an["segments"],
+                        "plateau": an["plateau"], "plateau_range": an["plateau_range"],
+                        "peak": an["peak"], "window_stat": None,
+                        "frame_ids": [e["row"]["id"] for e in usable
+                                      for ps in [next((s for s in e["metrics"]["spots"]
+                                                       if s["peak_id"] == pid), None)]
+                                      if ps],
+                    }
+            sug = kinetics.suggest_window(list(curves.values()))
+        else:
+            sug = None
+        # 窗口草稿/已确认窗口统计
+        win = {"t0": srow["window_t0"], "t1": srow["window_t1"]}
+        if win["t0"] is not None and win["t1"] is not None:
+            frame_records = _kin_frame_records(out_frames)
+            vw = kinetics.validate_window(win, frame_records, curves,
+                                          cfg=kinetics.DEFAULTS)
+            for pid, st in vw["window_stats"].items():
+                if pid in curves:
+                    curves[pid]["window_stat"] = st
+        # 帧级问题上抛(饱和/漂移为警告,窗口内才阻断)
+        sat_frames, drift_frames, reg_bad = [], [], []
+        for e in out_frames:
+            fid = e["row"]["id"]
+            if e["error"] and e["error"]["kind"] in kinetics.BLOCKERS \
+                    and not e["row"]["excluded"]:
+                reg_bad.append((fid, e["error"]))
+                continue
+            if not e["metrics"] or e["row"]["excluded"]:
+                continue
+            if any(s["saturated_px"] >= qc.THRESHOLDS["sat_min_count"]
+                   for s in e["metrics"]["spots"]):
+                sat_frames.append(fid)
+            if any(s.get("drift_px") is not None
+                   and s["drift_px"] > kinetics.DEFAULTS["drift_centroid_px"]
+                   for s in e["metrics"]["spots"]):
+                drift_frames.append(fid)
+        for fid, err in reg_bad:
+            issues.append({"kind": err["kind"], "frame_ids": [fid],
+                           "message": f"帧 #{fid}: {err['message']}"})
+        if sat_frames:
+            issues.append({"kind": "saturated", "frame_ids": sat_frames,
+                           "message": f"帧 {sat_frames} 积分区检出像素饱和"})
+        if drift_frames:
+            issues.append({"kind": "spot_drift", "frame_ids": drift_frames,
+                           "message": f"帧 {drift_frames} 存在斑点质心漂移超限"})
+        # 帧数
+        if not frames:
+            issues.append({"kind": "no_frames", "frame_ids": [],
+                           "message": "序列中还没有任何帧"})
+        elif len(usable) < kinetics.DEFAULTS["min_valid_frames"]:
+            issues.append({
+                "kind": "few_frames", "frame_ids": [e["row"]["id"] for e in usable],
+                "message": f"有效帧仅 {len(usable)} 个,不足 "
+                           f"{kinetics.DEFAULTS['min_valid_frames']} 个"})
+        # 排除无理由
+        for f in frames:
+            if f["excluded"] and not f["exclude_reason"].strip():
+                issues.append({"kind": "exclude_reason_required", "frame_ids": [f["id"]],
+                               "message": f"帧 #{f['seq'] + 1} 已排除但未填写理由"})
+
+        # 版本(过期判定)
+        plate_fp = plate["fingerprint"] if plate else ""
+        source_fp = kin_source_fingerprint(frames, srow,
+                                           {"analysis": a, "bundle": bundle,
+                                            "fingerprint": plate_fp})
+        versions = []
+        for v in db.list_kinetic_versions(c, sid):
+            v["stale"] = v["source_fp"] != source_fp
+            versions.append(v)
+        return {
+            "series": srow, "analysis": {"id": a["id"], "name": a["name"],
+                                         "image_sha1": a["image_sha1"]},
+            "geometry": ({"version": bundle["geometry_version"],
+                          "derived": derived} if bundle else None),
+            "lanes": lanes_def, "lane_label": lane_label,
+            "frames": out_frames, "curves": curves, "suggest": sug,
+            "window": win, "issues": issues, "source_fingerprint": source_fp,
+            "versions": versions,
+            "n_usable": len(usable), "defaults": dict(kinetics.DEFAULTS),
+        }
+
+    def _kin_frame_records(out_frames):
+        """validate_window 需要的帧记录结构。"""
+        recs = []
+        for e in out_frames:
+            f = e["row"]
+            per_spot = {}
+            sat_any = False
+            if e["metrics"]:
+                for s in e["metrics"]["spots"]:
+                    per_spot[s["peak_id"]] = s
+                    if s["saturated_px"] >= qc.THRESHOLDS["sat_min_count"]:
+                        sat_any = True
+            recs.append({"id": f["id"], "seq": f["seq"], "t_sec": e["t_sec"],
+                         "usable": e["metrics"] is not None and e["error"] is None,
+                         "excluded": bool(f["excluded"]),
+                         "reason": f["exclude_reason"], "sat_any": sat_any,
+                         "per_spot": per_spot})
+        return recs
+
+    def _kin_compact_frame(entry, profile_bins=240):
+        """逐帧结果压缩为前端 JSON:密度曲线降采样,逐斑点标量。"""
+        f, m = entry["row"], entry["metrics"]
+        out = {"id": f["id"], "seq": f["seq"], "taken_at": f["taken_at"],
+               "t_sec": entry["t_sec"], "width": f["image_width"],
+               "height": f["image_height"], "excluded": bool(f["excluded"]),
+               "exclude_reason": f["exclude_reason"], "dx": f["dx"], "dy": f["dy"],
+               "control_points": f["control_points"], "error": entry["error"],
+               "residual": m["residual"] if m else None, "spots": [], "profiles": {}}
+        if m:
+            out["spots"] = m["spots"]
+            out["profiles"] = {str(lid): kinetics.downsample_profile(p, profile_bins)
+                               for lid, p in m["profiles"].items()}
+        return out
+
+    def kinetic_state(c, sid):
+        st = kin_compute(c, sid)
+        st["frames_out"] = [_kin_compact_frame(e) for e in st["frames"]]
+        return st
+
+    @app.get("/api/analyses/<int:aid>/kinetics")
+    def list_kinetics(aid):
+        with con() as c:
+            get_analysis_or_404(c, aid)
+            return jsonify(db.list_kinetic_series(c, aid))
+
+    @app.post("/api/analyses/<int:aid>/kinetics")
+    def create_kinetics(aid):
+        p = request.get_json(force=True) or {}
+        with con() as c:
+            get_analysis_or_404(c, aid)
+            name = (p.get("name") or "").strip()[:80]
+            start_at = (p.get("start_at") or "").strip()
+            if start_at:
+                try:
+                    kinetics.parse_time(start_at)
+                except ValueError as e:
+                    abort(400, f"显色开始时刻无效: {e}")
+            sid = db.create_kinetic_series(c, aid, name, start_at)
+            return jsonify(kinetic_state(c, sid))
+
+    @app.get("/api/kinetics/<int:sid>")
+    def get_kinetics(sid):
+        with con() as c:
+            return jsonify(kinetic_state(c, sid))
+
+    @app.post("/api/kinetics/<int:sid>/meta")
+    def update_kinetics_meta(sid):
+        p = request.get_json(force=True) or {}
+        with con() as c:
+            srow = db.get_kinetic_series(c, sid)
+            if not srow:
+                abort(404, "时间序列不存在")
+            fields = {}
+            if "name" in p:
+                fields["name"] = (str(p["name"] or "")).strip()[:80]
+            if "start_at" in p:
+                start_at = (str(p["start_at"] or "")).strip()
+                if start_at:
+                    try:
+                        kinetics.parse_time(start_at)
+                    except ValueError as e:
+                        abort(400, f"显色开始时刻无效: {e}")
+                fields["start_at"] = start_at
+            if "window_t0" in p:
+                fields["window_t0"] = None if p["window_t0"] in (None, "") \
+                    else float(p["window_t0"])
+            if "window_t1" in p:
+                fields["window_t1"] = None if p["window_t1"] in (None, "") \
+                    else float(p["window_t1"])
+            db.update_kinetic_series(c, sid, fields)
+            return jsonify(kinetic_state(c, sid))
+
+    @app.post("/api/kinetics/<int:sid>/delete")
+    def delete_kinetics(sid):
+        with con() as c:
+            srow = db.get_kinetic_series(c, sid)
+            if not srow:
+                abort(404, "时间序列不存在")
+            aid = srow["analysis_id"]
+            db.delete_kinetic_series(c, sid)
+            return jsonify({"ok": True, "analysis_id": aid,
+                            "series": db.list_kinetic_series(c, aid)})
+
+    @app.post("/api/kinetics/<int:sid>/frames")
+    def upload_kinetic_frame(sid):
+        f = request.files.get("file")
+        if not f:
+            abort(400, "缺少帧照片文件")
+        taken_at = (request.form.get("taken_at") or "").strip()
+        with con() as c:
+            srow = db.get_kinetic_series(c, sid)
+            if not srow:
+                abort(404, "时间序列不存在")
+            a, bundle = bundle_for(c, srow["analysis_id"])
+            if not bundle:
+                abort(400, "该板尚未完成几何标定,请先在单板定量页标定几何与积分边界")
+            if taken_at:
+                try:
+                    kinetics.parse_time(taken_at)
+                except ValueError as e:
+                    abort(400, f"拍摄时刻无效: {e}")
+            seq = c.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM kinetic_frames WHERE series_id=?",
+                (sid,)).fetchone()[0]
+            fid = db.add_kinetic_frame(c, sid, seq, "", 0, 0, "", taken_at, [])
+            ext = os.path.splitext(f.filename or "frame.png")[1] or ".png"
+            path = os.path.join(uploads, f"k{sid}_f{fid}{ext}")
+            f.save(path)
+            with Image.open(path) as im:
+                w, h = im.size
+                im.convert("RGB")
+            with open(path, "rb") as fh:
+                sha1 = hashlib.sha1(fh.read()).hexdigest()
+            cps = kin_default_controls(bundle["geometry"]["derived"], w, h)
+            db.update_kinetic_frame(c, fid, {"control_points": cps})
+            # add 时路径为空,直接补列
+            c.execute("UPDATE kinetic_frames SET image_path=?, image_width=?,"
+                      " image_height=?, image_sha1=? WHERE id=?",
+                      (path, w, h, sha1, fid))
+            return jsonify(kinetic_state(c, sid))
+
+    @app.get("/api/kinetics/frames/<int:fid>/image")
+    def kinetic_frame_image(fid):
+        with con() as c:
+            fr = db.get_kinetic_frame(c, fid)
+            if not fr:
+                abort(404, "帧不存在")
+            if not os.path.exists(fr["image_path"]):
+                abort(404, "帧照片文件缺失")
+            return send_file(fr["image_path"])
+
+    @app.get("/api/kinetics/frames/<int:fid>/rectified.png")
+    def kinetic_frame_rectified(fid):
+        """配准后的校正图(供叠加图与配准检查)。配准失败返回 409 + 原因。"""
+        with con() as c:
+            fr = db.get_kinetic_frame(c, fid)
+            if not fr:
+                abort(404, "帧不存在")
+            srow = db.get_kinetic_series(c, fr["series_id"])
+            a, bundle = bundle_for(c, srow["analysis_id"])
+            if not bundle:
+                abort(400, "该板尚未完成几何标定")
+            cps = fr["control_points"]
+            corners = [p for p in cps if p.get("kind") == "corner"]
+            checks = [p for p in cps if p.get("kind") == "check"]
+            pairs = [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in corners] \
+                if len(corners) == 4 else \
+                [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in cps]
+            try:
+                with Image.open(fr["image_path"]) as im:
+                    gray, _, resid = kinetics.rectify_frame(
+                        im, bundle["geometry"]["derived"], pairs,
+                        [(p["fx"], p["fy"], p["rx"], p["ry"]) for p in checks],
+                        fr["dx"], fr["dy"], kinetics.DEFAULTS["reg_residual_max"])
+            except kinetics.RegistrationError as e:
+                return jsonify({"error": 409, "description": e.message,
+                                "kind": e.kind}), 409
+            buf = io.BytesIO()
+            gray.save(buf, "PNG")
+            buf.seek(0)
+            return send_file(buf, mimetype="image/png")
+
+    @app.post("/api/kinetics/frames/<int:fid>")
+    def update_kinetic_frame_api(fid):
+        p = request.get_json(force=True) or {}
+        with con() as c:
+            fr = db.get_kinetic_frame(c, fid)
+            if not fr:
+                abort(404, "帧不存在")
+            fields = {}
+            if "taken_at" in p:
+                ta = (str(p["taken_at"] or "")).strip()
+                if ta:
+                    try:
+                        kinetics.parse_time(ta)
+                    except ValueError as e:
+                        abort(400, f"拍摄时刻无效: {e}")
+                fields["taken_at"] = ta
+            if "dx" in p:
+                fields["dx"] = float(p["dx"] or 0)
+            if "dy" in p:
+                fields["dy"] = float(p["dy"] or 0)
+            if "excluded" in p:
+                excluded = bool(p["excluded"])
+                reason = (str(p.get("exclude_reason") or "")).strip()
+                if excluded and not reason:
+                    abort(400, "排除坏帧必须填写理由")
+                fields["excluded"] = 1 if excluded else 0
+                fields["exclude_reason"] = reason
+            elif "exclude_reason" in p:
+                fields["exclude_reason"] = (str(p["exclude_reason"] or "")).strip()
+            if "control_points" in p:
+                cps = p["control_points"]
+                clean = []
+                for cp in cps:
+                    clean.append({"fx": float(cp["fx"]), "fy": float(cp["fy"]),
+                                  "rx": float(cp["rx"]), "ry": float(cp["ry"]),
+                                  "kind": "check" if cp.get("kind") == "check"
+                                  else "corner"})
+                fields["control_points"] = clean
+            db.update_kinetic_frame(c, fid, fields)
+            return jsonify(kinetic_state(c, fr["series_id"]))
+
+    @app.post("/api/kinetics/frames/<int:fid>/delete")
+    def delete_kinetic_frame_api(fid):
+        with con() as c:
+            fr = db.get_kinetic_frame(c, fid)
+            if not fr:
+                abort(404, "帧不存在")
+            sid = fr["series_id"]
+            try:
+                if fr["image_path"] and os.path.exists(fr["image_path"]):
+                    os.remove(fr["image_path"])
+            except OSError:
+                pass
+            db.delete_kinetic_frame(c, fid)
+            return jsonify(kinetic_state(c, sid))
+
+    def _kin_build_snapshot(c, st, win):
+        """成版快照:锁定所用帧、配准参数与窗口,逐帧面积/曲线/窗口统计全部留痕。"""
+        curves, frames = st["curves"], st["frames"]
+        frame_records = _kin_frame_records(frames)
+        vw = kinetics.validate_window(win, frame_records, curves,
+                                      cfg=kinetics.DEFAULTS)
+        spot_by_peak = {}
+        if st.get("geometry"):
+            data = cal_plate_data(c, st["analysis"]["id"])
+            spot_by_peak = {s["peak_id"]: s for s in data["spots"]}
+        snap_frames = []
+        for e in frames:
+            f = e["row"]
+            snap_frames.append({
+                "frame_id": f["id"], "seq": f["seq"], "taken_at": f["taken_at"],
+                "t_sec": e["t_sec"], "image_sha1": f["image_sha1"],
+                "image_width": f["image_width"], "image_height": f["image_height"],
+                "control_points": f["control_points"], "dx": f["dx"], "dy": f["dy"],
+                "excluded": bool(f["excluded"]), "exclude_reason": f["exclude_reason"],
+                "residual": e["metrics"]["residual"] if e["metrics"] else None,
+                "error": e["error"],
+                "spots": ([{"peak_id": s["peak_id"], "lane_id": s["lane_id"],
+                            "area": s["area"], "height": s["height"],
+                            "center_y": s["center_y"], "drift_px": s["drift_px"],
+                            "saturated_px": s["saturated_px"]}
+                           for s in e["metrics"]["spots"]] if e["metrics"] else []),
+            })
+        snap_curves = []
+        for pid, cv in curves.items():
+            sp = spot_by_peak.get(pid, {})
+            snap_curves.append({
+                "peak_id": pid, "lane_id": cv["lane_id"],
+                "lane_label": cv["lane_label"], "spot_no": sp.get("spot_no"),
+                "rf": sp.get("rf"), "y0": cv["y0"], "y1": cv["y1"],
+                "times": cv["times"], "areas": cv["areas"],
+                "normalized": cv["normalized"], "segments": cv["segments"],
+                "plateau": cv["plateau"], "peak": cv["peak"],
+                "window_stat": vw["window_stats"].get(pid),
+            })
+        g = st["geometry"]
+        return {
+            "tool": TOOL, "tool_version": __version__, "saved_at": db.now(),
+            "analysis_id": st["analysis"]["id"], "analysis_name": st["analysis"]["name"],
+            "image_sha1": st["analysis"]["image_sha1"],
+            "geometry_version": g["version"] if g else None,
+            "derived": g["derived"] if g else None,
+            "lanes": [{"id": l["id"], "x0": l["x0"], "x1": l["x1"], "label": l["label"],
+                       "peaks": [{"id": p["id"], "y0": p["y0"], "y1": p["y1"]}
+                                 for p in l["peaks"]]} for l in st["lanes"]],
+            "start_at": st["series"]["start_at"], "window": win,
+            "thresholds": dict(kinetics.DEFAULTS),
+            "frames": snap_frames, "curves": snap_curves,
+            "window_issues": vw["issues"], "window_ok": vw["ok"],
+        }
+
+    @app.post("/api/kinetics/<int:sid>/confirm")
+    def confirm_kinetic_window(sid):
+        """确认取值窗口:阻断问题存在时拒绝,不形成版本。"""
+        p = request.get_json(force=True) or {}
+        with con() as c:
+            srow = db.get_kinetic_series(c, sid)
+            if not srow:
+                abort(404, "时间序列不存在")
+            try:
+                t0 = float(p.get("t0")); t1 = float(p.get("t1"))
+            except (TypeError, ValueError):
+                abort(400, "取值窗口时刻无效")
+            if t1 <= t0:
+                abort(400, "取值窗口结束时刻须晚于开始时刻")
+            st = kin_compute(c, sid)
+            # 先把草稿窗口落库(被拒绝也保留用户拖动结果)
+            db.update_kinetic_series(c, sid, {"window_t0": t0, "window_t1": t1})
+            frame_records = _kin_frame_records(st["frames"])
+            vw = kinetics.validate_window({"t0": t0, "t1": t1}, frame_records,
+                                          st["curves"], cfg=kinetics.DEFAULTS)
+            hard = [i for i in vw["issues"] if i["type"] in kinetics.BLOCKERS]
+            # 序列级阻断(时刻/配准/有效帧)
+            seq_hard = [i for i in st["issues"] if i["kind"] in kinetics.BLOCKERS]
+            if hard or seq_hard:
+                msgs = [i["message"] for i in hard] + \
+                       [i["message"] for i in seq_hard]
+                abort(400, "不能确认取值窗口:" + ";".join(msgs))
+            snap = _kin_build_snapshot(c, st, {"t0": t0, "t1": t1})
+            vid, ver = db.add_kinetic_version(c, sid, t0, t1, snap,
+                                              st["source_fingerprint"])
+            return jsonify({"version_id": vid, "version": ver,
+                            "state": kinetic_state(c, sid)})
+
+    @app.get("/api/kinetics/versions/<int:vid>")
+    def get_kinetic_version(vid):
+        with con() as c:
+            v = db.get_kinetic_version(c, vid)
+            if not v:
+                abort(404, "版本不存在")
+            srow = db.get_kinetic_series(c, v["series_id"])
+            frames = db.list_kinetic_frames(c, v["series_id"])
+            a, bundle = bundle_for(c, srow["analysis_id"])
+            cur_fp = kin_source_fingerprint(
+                frames, srow,
+                {"analysis": a, "bundle": bundle,
+                 "fingerprint": cal_plate_data(c, srow["analysis_id"])["fingerprint"]
+                 if bundle else ""})
+            return jsonify({"version": {k: v[k] for k in
+                                        ("id", "version", "window_t0", "window_t1",
+                                         "source_fp", "is_current", "created_at")},
+                            "snapshot": v["snapshot"], "stale": v["source_fp"] != cur_fp,
+                            "current_fp": cur_fp})
+
+    def _kin_version_or_400(c, vid):
+        v = db.get_kinetic_version(c, vid)
+        if not v:
+            abort(404, "版本不存在")
+        srow = db.get_kinetic_series(c, v["series_id"])
+        frames = db.list_kinetic_frames(c, v["series_id"])
+        a, bundle = bundle_for(c, srow["analysis_id"])
+        cur_fp = kin_source_fingerprint(
+            frames, srow,
+            {"analysis": a, "bundle": bundle,
+             "fingerprint": cal_plate_data(c, srow["analysis_id"])["fingerprint"]
+             if bundle else ""})
+        stale = v["source_fp"] != cur_fp
+        return v, v["snapshot"], stale, cur_fp
+
+    @app.get("/api/kinetics/versions/<int:vid>/frames.csv")
+    def export_kinetic_csv(vid):
+        with con() as c:
+            v, snap, stale, _ = _kin_version_or_400(c, vid)
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["series_id", "version", "stale", "frame_id", "frame_seq",
+                        "taken_at", "t_sec", "excluded", "exclude_reason",
+                        "residual_px", "lane_id", "lane_label", "peak_id", "spot_no",
+                        "rf", "area", "height", "center_y", "drift_px",
+                        "saturated_px", "in_window", "window_mean", "window_cv_pct",
+                        "window_n"])
+            win = snap["window"]
+            stat_by_peak = {cv["peak_id"]: cv.get("window_stat") for cv in snap["curves"]}
+            spot_no = {cv["peak_id"]: cv.get("spot_no") for cv in snap["curves"]}
+            rf_by = {cv["peak_id"]: cv.get("rf") for cv in snap["curves"]}
+            lane_label = {l["id"]: l["label"] for l in snap["lanes"]}
+            for fr in snap["frames"]:
+                in_win = win["t0"] <= (fr["t_sec"] or -1) <= win["t1"] \
+                    and not fr["excluded"]
+                for s in fr["spots"]:
+                    stt = stat_by_peak.get(s["peak_id"]) or {}
+                    w.writerow([
+                        v["series_id"], v["version"], 1 if stale else 0,
+                        fr["frame_id"], fr["seq"], fr["taken_at"],
+                        "" if fr["t_sec"] is None else f"{fr['t_sec']:.3f}",
+                        1 if fr["excluded"] else 0, fr["exclude_reason"],
+                        "" if fr["residual"] is None else f"{fr['residual']:.3f}",
+                        s["lane_id"], lane_label.get(s["lane_id"], ""),
+                        s["peak_id"], spot_no.get(s["peak_id"], ""),
+                        "" if rf_by.get(s["peak_id"]) is None
+                        else f"{rf_by[s['peak_id']]:.4f}",
+                        f"{s['area']:.1f}", f"{s['height']:.1f}",
+                        f"{s['center_y']:.2f}",
+                        "" if s["drift_px"] is None else f"{s['drift_px']:.2f}",
+                        s["saturated_px"], 1 if in_win else 0,
+                        f"{stt['mean']:.1f}" if stt else "",
+                        f"{stt['cv_pct']:.2f}" if stt and stt.get("cv_pct") is not None else "",
+                        stt.get("n", "") if stt else ""])
+            mem = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+            mem.seek(0)
+            tag = "_EXPIRED" if stale else ""
+            return send_file(mem, mimetype="text/csv", as_attachment=True,
+                             download_name=f"k{v['series_id']}_v{v['version']}_frames{tag}.csv")
+
+    @app.get("/api/kinetics/versions/<int:vid>/recompute.json")
+    def export_kinetic_json(vid):
+        with con() as c:
+            v, snap, stale, cur_fp = _kin_version_or_400(c, vid)
+            payload = {"tool": TOOL, "tool_version": __version__,
+                       "exported_at": db.now(), "series_id": v["series_id"],
+                       "version": v["version"], "version_id": v["id"],
+                       "window": {"t0": v["window_t0"], "t1": v["window_t1"]},
+                       "source_fingerprint": v["source_fp"],
+                       "current_fingerprint": cur_fp, "stale": stale,
+                       "snapshot": snap}
+            mem = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode())
+            mem.seek(0)
+            tag = "_EXPIRED" if stale else ""
+            return send_file(mem, mimetype="application/json", as_attachment=True,
+                             download_name=f"k{v['series_id']}_v{v['version']}_recompute{tag}.json")
+
+    @app.get("/api/kinetics/versions/<int:vid>/figure.png")
+    def export_kinetic_figure(vid):
+        with con() as c:
+            v, snap, stale, _ = _kin_version_or_400(c, vid)
+            curves = []
+            for cv in snap["curves"]:
+                wm = (cv.get("window_stat") or {}).get("mean")
+                curves.append({"lane_label": cv["lane_label"],
+                               "spot_no": cv.get("spot_no"), "peak_id": cv["peak_id"],
+                               "times": cv["times"], "areas": cv["areas"],
+                               "normalized": cv["normalized"], "peak": cv["peak"],
+                               "window_mean": wm})
+            frames = [{"seq": f["seq"], "t_sec": f["t_sec"],
+                       "excluded": f["excluded"], "usable": not f["error"]}
+                      for f in snap["frames"]]
+            img = kinetics.draw_kinetics(
+                {"id": snap["analysis_id"], "name": snap["analysis_name"]},
+                curves, snap["window"], frames, stale=stale)
+            path = os.path.join(exports, f"k{v['series_id']}_v{v['version']}_kinetics.png")
+            img.save(path)
+            tag = "_EXPIRED" if stale else ""
+            return send_file(path, mimetype="image/png",
+                             as_attachment=request.args.get("dl") == "1",
+                             download_name=os.path.basename(path).replace(
+                                 ".png", f"{tag}.png"))
+
     # ---------- 校准曲线与含量反算 ----------
 
     cal_cache = {}   # analysis_id -> {fp, data}
@@ -1062,16 +1722,86 @@ def create_app(data_dir=None):
         cal_cache[aid] = {"fp": fp, "data": data}
         return data
 
-    def cal_source_fingerprint(data, cal, rows):
+    def cal_kinetic_override(c, aid):
+        """下游校准引用显色时间序列:取该板当前有效(未过期)的已确认版本,
+        用其锁定窗口内面积均值替换单帧面积。只允许引用有效版本:
+        - 无已确认版本 / 版本过期(照片/几何/积分边界变更)=> 不替换,回退单帧;
+        - 过期已确认版本给警告(不阻断),提示回时间序列页重新确认。
+        返回 (kin_info|None, warnings:[str])。kin_info 含快照窗口统计。
+        """
+        series = db.list_kinetic_series(c, aid)
+        chosen = None
+        for srow in series:
+            vid = srow.get("current_version")
+            if not vid:
+                continue
+            v = db.get_kinetic_version(c, vid)
+            if not v or not v["is_current"]:
+                continue
+            cur_fp = kin_compute(c, srow["id"])["source_fingerprint"]
+            if v["source_fp"] == cur_fp:
+                chosen = (srow, v, False)
+                break
+            chosen = chosen or (srow, v, True)   # 记下过期版本做警告
+        if not chosen:
+            return None, []
+        srow, v, stale = chosen
+        if stale:
+            return ({"series_id": srow["id"], "series_name": srow["name"],
+                     "version_id": v["id"], "version": v["version"],
+                     "window": {"t0": v["window_t0"], "t1": v["window_t1"]},
+                     "stale": True, "stats": {}},
+                    [f"显色时间序列 #{srow['id']} 的已确认取值窗口 v{v['version']}"
+                     "已因照片/板面几何/积分边界变更而过期,本次校准回退为单帧面积,"
+                     "请回时间序列页重新确认后再成线"])
+        stats = {}
+        for cv in v["snapshot"]["curves"]:
+            st = cv.get("window_stat")
+            if st:
+                stats[cv["peak_id"]] = st
+        return ({"series_id": srow["id"], "series_name": srow["name"],
+                 "version_id": v["id"], "version": v["version"],
+                 "window": {"t0": v["window_t0"], "t1": v["window_t1"]},
+                 "stale": False, "stats": stats,
+                 "source_fp": v["source_fp"]}, [])
+
+    def cal_data_with_kinetics(c, aid):
+        """cal_plate_data + 时间序列窗口面积替换(浅拷贝,不污染指纹缓存)。"""
+        base = cal_plate_data(c, aid)
+        if not base or not base["bundle"]:
+            return base, None, []
+        kin, warns = cal_kinetic_override(c, aid)
+        if not kin or kin.get("stale"):
+            return base, kin, warns
+        stats = kin["stats"]
+        spots = []
+        for s in base["spots"]:
+            s2 = dict(s)
+            st = stats.get(s["peak_id"])
+            if st:
+                s2["area"] = st["mean"]
+                s2["kinetic_window_n"] = st["n"]
+                s2["kinetic_cv_pct"] = st["cv_pct"]
+            spots.append(s2)
+        data = dict(base)
+        data["spots"] = spots
+        return data, kin, warns
+
+    def cal_source_fingerprint(data, cal, rows, kin=None):
         """校准来源指纹:板指纹(几何/泳道/峰边界)+ 影响拟合、反算与标签的全部输入。
 
         含校准元数据(名称/目标/参考 Rf/容差/单位)与每条泳道标注(角色/绑定斑点/
         浓度/进样体积/稀释/排除及理由)。任一变化 => 已成线版本过期。
+        时间序列版本切换/失效(窗口面积变)也纳入指纹。
         模型种类不参与:每版模型在快照中各自固定 model,切换模型不使旧模型失效。
         """
         payload = {
             "plate_fp": data["fingerprint"] if data else "",
             "image_sha1": (data["analysis"]["image_sha1"] if data else ""),
+            "kinetic": (None if not kin else
+                        {"series_id": kin["series_id"], "version_id": kin["version_id"],
+                         "stale": kin.get("stale", False),
+                         "source_fp": kin.get("source_fp", "")}),
             "cfg": {"name": cal["name"], "target_name": cal["target_name"],
                     "target_rf": cal["target_rf"], "rf_tol": cal["rf_tol"],
                     "conc_unit": cal["conc_unit"], "vol_unit": cal["vol_unit"]},
@@ -1155,7 +1885,7 @@ def create_app(data_dir=None):
         cal = db.get_calibration(c, cal_id)
         if not cal:
             abort(404, "校准不存在")
-        data = cal_plate_data(c, cal["analysis_id"])
+        data, kin, kin_warns = cal_data_with_kinetics(c, cal["analysis_id"])
         analysis = data["analysis"]
         bundle = data["bundle"]
         rows = db.list_cal_lanes(c, cal_id)
@@ -1163,6 +1893,7 @@ def create_app(data_dir=None):
         out = {"calibration": cal, "analysis": {
                    "id": analysis["id"], "name": analysis["name"],
                    "geometry_version": data["geometry_version"]},
+               "kinetic": kin, "kinetic_warnings": kin_warns,
                "lanes": [], "evaluation": None, "versions": [],
                "defaults": dict(calibration.DEFAULTS),
                "models": [{"kind": m, "label": calibration.MODEL_LABELS[m]}
@@ -1170,7 +1901,7 @@ def create_app(data_dir=None):
 
         if not bundle:
             out["no_geometry"] = True
-            out["source_fingerprint"] = cal_source_fingerprint(data, cal, rows)
+            out["source_fingerprint"] = cal_source_fingerprint(data, cal, rows, kin)
             return out
         spots_by_lane = {}
         lane_by_id = {}
@@ -1184,6 +1915,19 @@ def create_app(data_dir=None):
         ev = calibration.evaluate(
             standards, blanks, unknowns, cal["model"],
             target_name=cal["target_name"])
+        # 时间序列窗口引用:有效替换给提示;过期已确认版本给警告(不阻断成线)
+        if kin and not kin.get("stale"):
+            ev["issues"].append({
+                "type": "kinetic_window", "level": "info", "scope": "model",
+                "message": f"响应面积取自显色时间序列 #{kin['series_id']} "
+                           f"v{kin['version']} 锁定窗口 "
+                           f"[{kinetics.format_t(kin['window']['t0'])},"
+                           f" {kinetics.format_t(kin['window']['t1'])}] 内均值",
+                "lane_ids": [], "peak_ids": []})
+        for msg in kin_warns:
+            ev["issues"].append({"type": "kinetic_expired", "level": "warning",
+                                 "scope": "model", "message": msg,
+                                 "lane_ids": [], "peak_ids": []})
         out["evaluation"] = ev
         out["derived"] = bundle["geometry"]["derived"]
 
@@ -1207,8 +1951,8 @@ def create_app(data_dir=None):
                 "annotation": entries[lid], "orphan": True})
         out["missing_lanes"] = missing
 
-        # 当前来源指纹(板几何/边界 + 校准元数据 + 泳道标注)
-        source_fp = cal_source_fingerprint(data, cal, rows)
+        # 当前来源指纹(板几何/边界 + 校准元数据 + 泳道标注 + 时间序列窗口版本)
+        source_fp = cal_source_fingerprint(data, cal, rows, kin)
         out["source_fingerprint"] = source_fp
 
         # 历史版本(含过期判定):来源指纹任一变化即过期
@@ -1372,8 +2116,11 @@ def create_app(data_dir=None):
             db.update_calibration(c, cal_id, {"model": model})
             return jsonify(calibration_state(c, cal_id))
 
-    def _build_snapshot(cal, data, ev):
-        """成线快照:几何、背景/检测参数、每条来源的积分边界与斑点 ID、评估结果。"""
+    def _build_snapshot(cal, data, ev, kin=None):
+        """成线快照:几何、背景/检测参数、每条来源的积分边界与斑点 ID、评估结果。
+
+        响应取自时间序列锁定窗口时,kin 记录来源序列/版本/窗口,供下游审计。
+        """
         bundle = data["bundle"]
         spot_by_peak = {s["peak_id"]: s for s in data["spots"]}
 
@@ -1400,6 +2147,10 @@ def create_app(data_dir=None):
                        "rf_tol": cal["rf_tol"]},
             "units": {"conc": cal["conc_unit"], "vol": cal["vol_unit"]},
             "model": ev["model"],
+            "kinetic_source": (None if not kin else {
+                "series_id": kin["series_id"], "series_name": kin.get("series_name"),
+                "version_id": kin["version_id"], "version": kin["version"],
+                "window": kin["window"], "stale": kin.get("stale", False)}),
             "fit": ev["fit"],
             "range": ev["range"],
             "issues": ev["issues"],
@@ -1443,11 +2194,11 @@ def create_app(data_dir=None):
                 abort(400, "校准存在阻断性问题,不能成线:" +
                       ";".join(i["message"] for i in ev["issues"]
                                if i["level"] == "error" and i["type"] in calibration.BLOCKERS))
-            data = cal_plate_data(c, cal["analysis_id"])
+            data, kin, _ = cal_data_with_kinetics(c, cal["analysis_id"])
             cal = db.get_calibration(c, cal_id)   # 取含 model 更新后的元数据
             rows = db.list_cal_lanes(c, cal_id)
-            source_fp = cal_source_fingerprint(data, cal, rows)
-            snap = _build_snapshot(cal, data, ev)
+            source_fp = cal_source_fingerprint(data, cal, rows, kin)
+            snap = _build_snapshot(cal, data, ev, kin)
             vid, ver = db.add_cal_version(c, cal_id, model, ev["fit"], snap,
                                           source_fp)
             return jsonify({"version_id": vid, "version": ver,
@@ -1462,9 +2213,9 @@ def create_app(data_dir=None):
             v = db.get_cal_version(c, vid)
             if not v or v["calibration_id"] != cal_id:
                 abort(404, "版本不存在")
+            data, kin, _ = cal_data_with_kinetics(c, cal["analysis_id"])
             cur_fp = cal_source_fingerprint(
-                cal_plate_data(c, cal["analysis_id"]), cal,
-                db.list_cal_lanes(c, cal_id))
+                data, cal, db.list_cal_lanes(c, cal_id), kin)
             return jsonify({"version": {k: v[k] for k in
                                         ("id", "version", "model", "fit", "source_fp",
                                          "is_current", "created_at")},
@@ -1495,9 +2246,9 @@ def create_app(data_dir=None):
         v = db.get_cal_version(c, vid)
         if not v or v["calibration_id"] != cal_id:
             abort(404, "版本不存在")
+        data, kin, _ = cal_data_with_kinetics(c, cal["analysis_id"])
         cur_fp = cal_source_fingerprint(
-            cal_plate_data(c, cal["analysis_id"]), cal,
-            db.list_cal_lanes(c, cal_id))
+            data, cal, db.list_cal_lanes(c, cal_id), kin)
         stale = v["source_fp"] != cur_fp
         return cal, v, v["snapshot"], stale, cur_fp
 

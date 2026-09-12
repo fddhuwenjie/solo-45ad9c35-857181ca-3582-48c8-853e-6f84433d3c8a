@@ -126,6 +126,43 @@ CREATE TABLE IF NOT EXISTS calibration_versions (
   is_current INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS kinetic_series (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analysis_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  start_at TEXT NOT NULL DEFAULT '',   -- 显色开始时刻(HH:MM[:SS] 或留空按相对秒)
+  window_t0 REAL,                      -- 草稿取值窗口(秒)
+  window_t1 REAL,
+  current_version INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kinetic_frames (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  series_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,      -- 登记顺序
+  image_path TEXT NOT NULL,
+  image_width INTEGER NOT NULL DEFAULT 0,
+  image_height INTEGER NOT NULL DEFAULT 0,
+  image_sha1 TEXT NOT NULL DEFAULT '',
+  taken_at TEXT NOT NULL DEFAULT '',   -- 拍摄时刻(钟点串或相对秒数)
+  control_points TEXT NOT NULL,        -- [{fx,fy,rx,ry,kind: corner|check}]
+  dx REAL NOT NULL DEFAULT 0,          -- 校正空间配准微调
+  dy REAL NOT NULL DEFAULT 0,
+  excluded INTEGER NOT NULL DEFAULT 0,
+  exclude_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kinetic_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  series_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  window_t0 REAL NOT NULL,
+  window_t1 REAL NOT NULL,
+  snapshot TEXT NOT NULL,              -- 成版时完整快照(帧/时刻/配准/逐帧面积/窗口/统计)
+  source_fp TEXT NOT NULL,             -- 来源指纹(照片/时刻/配准/板面几何/积分边界);不符即过期
+  is_current INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -527,3 +564,134 @@ def add_cal_version(con, cal_id, model, fit, snapshot, source_fp):
     con.execute("UPDATE calibrations SET current_version=?, model=? WHERE id=?",
                 (vid, model, cal_id))
     return vid, version
+
+
+# ---------- 显色时间序列 ----------
+
+def create_kinetic_series(con, aid, name="", start_at=""):
+    cur = con.execute(
+        "INSERT INTO kinetic_series (analysis_id, name, start_at, created_at)"
+        " VALUES (?,?,?,?)", (aid, name, start_at, now()))
+    return cur.lastrowid
+
+
+def get_kinetic_series(con, sid):
+    r = con.execute("SELECT * FROM kinetic_series WHERE id=?", (sid,)).fetchone()
+    return row_to_dict(r) if r else None
+
+
+def list_kinetic_series(con, aid):
+    rows = con.execute(
+        """SELECT s.*,
+                  (SELECT COUNT(*) FROM kinetic_frames f WHERE f.series_id=s.id) AS n_frames,
+                  (SELECT COUNT(*) FROM kinetic_versions v WHERE v.series_id=s.id) AS n_version
+           FROM kinetic_series s WHERE analysis_id=? ORDER BY s.id DESC""",
+        (aid,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+def update_kinetic_series(con, sid, fields):
+    allowed = ("name", "start_at", "window_t0", "window_t1")
+    sets, vals = [], []
+    for k in allowed:
+        if k in fields:
+            sets.append(f"{k}=?")
+            vals.append(fields[k])
+    if sets:
+        vals.append(sid)
+        con.execute(f"UPDATE kinetic_series SET {', '.join(sets)} WHERE id=?", vals)
+
+
+def delete_kinetic_series(con, sid):
+    con.execute("DELETE FROM kinetic_versions WHERE series_id=?", (sid,))
+    con.execute("DELETE FROM kinetic_frames WHERE series_id=?", (sid,))
+    con.execute("DELETE FROM kinetic_series WHERE id=?", (sid,))
+
+
+def list_kinetic_frames(con, sid):
+    rows = con.execute(
+        "SELECT * FROM kinetic_frames WHERE series_id=? ORDER BY seq, id",
+        (sid,)).fetchall()
+    out = []
+    for r in rows:
+        d = row_to_dict(r)
+        d["control_points"] = json.loads(d["control_points"]) if d["control_points"] else []
+        out.append(d)
+    return out
+
+
+def add_kinetic_frame(con, sid, seq, image_path, w, h, sha1, taken_at,
+                      control_points, dx=0.0, dy=0.0):
+    cur = con.execute(
+        """INSERT INTO kinetic_frames
+           (series_id, seq, image_path, image_width, image_height, image_sha1,
+            taken_at, control_points, dx, dy, excluded, exclude_reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,0,'',?)""",
+        (sid, seq, image_path, w, h, sha1, taken_at,
+         json.dumps(control_points, ensure_ascii=False),
+         float(dx), float(dy), now()))
+    return cur.lastrowid
+
+
+def get_kinetic_frame(con, fid):
+    r = con.execute("SELECT * FROM kinetic_frames WHERE id=?", (fid,)).fetchone()
+    if not r:
+        return None
+    d = row_to_dict(r)
+    d["control_points"] = json.loads(d["control_points"]) if d["control_points"] else []
+    return d
+
+
+def update_kinetic_frame(con, fid, fields):
+    allowed = ("taken_at", "dx", "dy", "excluded", "exclude_reason", "seq")
+    sets, vals = [], []
+    for k in allowed:
+        if k in fields:
+            sets.append(f"{k}=?")
+            vals.append(fields[k])
+    if "control_points" in fields:
+        sets.append("control_points=?")
+        vals.append(json.dumps(fields["control_points"], ensure_ascii=False))
+    if sets:
+        vals.append(fid)
+        con.execute(f"UPDATE kinetic_frames SET {', '.join(sets)} WHERE id=?", vals)
+
+
+def delete_kinetic_frame(con, fid):
+    con.execute("DELETE FROM kinetic_frames WHERE id=?", (fid,))
+
+
+def add_kinetic_version(con, sid, t0, t1, snapshot, source_fp):
+    """旧版本失效(is_current=0),写入新版本并把 series.current_version 指过去。"""
+    version = (con.execute(
+        "SELECT COALESCE(MAX(version),0)+1 FROM kinetic_versions WHERE series_id=?",
+        (sid,)).fetchone()[0])
+    con.execute("UPDATE kinetic_versions SET is_current=0 WHERE series_id=?", (sid,))
+    cur = con.execute(
+        """INSERT INTO kinetic_versions
+           (series_id, version, window_t0, window_t1, snapshot, source_fp,
+            is_current, created_at)
+           VALUES (?,?,?,?,?,?,1,?)""",
+        (sid, version, t0, t1, json.dumps(snapshot, ensure_ascii=False),
+         source_fp, now()))
+    vid = cur.lastrowid
+    con.execute("UPDATE kinetic_series SET current_version=?, window_t0=?, window_t1=?"
+                " WHERE id=?", (vid, t0, t1, sid))
+    return vid, version
+
+
+def get_kinetic_version(con, vid):
+    r = con.execute("SELECT * FROM kinetic_versions WHERE id=?", (vid,)).fetchone()
+    if not r:
+        return None
+    d = row_to_dict(r)
+    d["snapshot"] = json.loads(d["snapshot"])
+    return d
+
+
+def list_kinetic_versions(con, sid):
+    rows = con.execute(
+        "SELECT id, series_id, version, window_t0, window_t1, source_fp, is_current,"
+        " created_at FROM kinetic_versions WHERE series_id=? ORDER BY version",
+        (sid,)).fetchall()
+    return [row_to_dict(r) for r in rows]
