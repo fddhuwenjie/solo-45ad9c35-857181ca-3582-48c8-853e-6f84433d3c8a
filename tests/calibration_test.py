@@ -393,25 +393,109 @@ def e2e():
     print("7d. 空白异常:定位空白泳道并阻断 ✔")
 
     # 8. 来源变更 -> 旧版本过期,仍可查看/导出(带 EXPIRED 标记)
-    before = c.get(f"/api/calibrations/{cal_id}").get_json()["versions"]
-    assert all(not v["stale"] for v in before)
-    # 移动一条泳道边界(泳道 id 保留但面积/指纹变化)
+    # 先恢复为完整 5 标准点标注(第 7 步的阻断性试探会持久化临时标注),另存基线版本。
+    # 注意 v1 是以“S5 排除”的来源成线的,本就与当前来源不同 => 它本来就 stale(符合预期)。
+    r = c.post(f"/api/calibrations/{cal_id}/fit", json=cal_payload(lanes)).get_json()
+    base_vid, base_ver = r["version_id"], r["version"]
+    before = {v["id"]: v for v in c.get(f"/api/calibrations/{cal_id}").get_json()["versions"]}
+    assert not before[base_vid]["stale"], "刚保存的版本与当前来源一致,不应过期"
+    assert before[vid]["stale"], "v1 以排除 S5 的来源成线,应已与当前来源不符"
+    # 移动一条泳道边界(泳道 id 保留但面积/板指纹变化)
     lanes_state = c.get(f"/api/analyses/{aid}").get_json()["lanes"]
     lanes_state[0]["x0"] += 3.0
     c.post(f"/api/analyses/{aid}/lanes", json={"lanes": [
         {"id": l["id"], "x0": l["x0"], "x1": l["x1"], "label": l["label"]}
         for l in lanes_state]})
-    after = c.get(f"/api/calibrations/{cal_id}").get_json()["versions"]
-    assert all(v["stale"] for v in after), "来源几何/边界变更后旧模型应过期"
-    old_vid = after[0]["id"]
-    vr = c.get(f"/api/calibrations/{cal_id}/versions/{old_vid}").get_json()
+    after = {v["id"]: v for v in c.get(f"/api/calibrations/{cal_id}").get_json()["versions"]}
+    assert all(v["stale"] for v in after.values()), "来源几何/边界变更后旧模型应过期"
+    vr = c.get(f"/api/calibrations/{cal_id}/versions/{base_vid}").get_json()
     assert vr["stale"] and vr["snapshot"]["fit"]["slope"], "过期版本仍可查看留档"
-    csv_old = c.get(f"/api/calibrations/{cal_id}/versions/{old_vid}/samples.csv")
-    fig_old = c.get(f"/api/calibrations/{cal_id}/versions/{old_vid}/figure.png")
+    csv_old = c.get(f"/api/calibrations/{cal_id}/versions/{base_vid}/samples.csv")
+    fig_old = c.get(f"/api/calibrations/{cal_id}/versions/{base_vid}/figure.png")
     assert csv_old.status_code == 200 and b"EXPIRED" in csv_old.headers.get(
         "Content-Disposition", "").encode()
-    assert fig_old.status_code == 200
+    assert fig_old.status_code == 200 and b"EXPIRED" in fig_old.headers.get(
+        "Content-Disposition", "").encode()
     print("8. 来源变更 -> 全部旧版本标为过期,仍可查看/导出(文件名带 EXPIRED) ✔")
+
+    # 8-fp1. 回归:改标准浓度(校准标注)即过期;再以新输入成线,新版本不过期,
+    #         且三类导出各自读取保存时快照、标签一致
+    aid_fp, lanes_fp = setup_cal_plate(c)
+    fp_cal = c.post(f"/api/analyses/{aid_fp}/calibrations", json={
+        "name": "fp", "target_name": "saved-target", "target_rf": RF_TARGET,
+        "conc_unit": "ng/uL", "vol_unit": "uL"}).get_json()["calibration"]["id"]
+    base = cal_payload(lanes_fp)
+    r = c.post(f"/api/calibrations/{fp_cal}/fit", json=base).get_json()
+    v1_id = r["version_id"]
+    st = c.get(f"/api/calibrations/{fp_cal}").get_json()
+    assert not any(v["stale"] for v in st["versions"])
+    # S1 浓度 1 -> 1.25(只 evaluate 落库,不另存):v1 立即过期
+    changed = cal_payload(lanes_fp, overrides={0: {"concentration": 1.25}})
+    c.post(f"/api/calibrations/{fp_cal}/evaluate", json=changed)
+    st = c.get(f"/api/calibrations/{fp_cal}").get_json()
+    v1 = next(v for v in st["versions"] if v["id"] == v1_id)
+    assert v1["stale"], "标准浓度属于来源输入,变化后旧版应 stale"
+    # 旧版导出仍读保存时快照:S1 浓度=1,目标 saved-target,单位 ng/uL/uL
+    j1 = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/model.json").get_json()
+    assert j1["stale"] and j1["snapshot"]["target"]["name"] == "saved-target"
+    p1 = next(p for p in j1["snapshot"]["points"]
+              if p["lane_label"] == "L1")
+    assert p1["concentration"] == 1.0 and j1["snapshot"]["units"] == \
+        {"conc": "ng/uL", "vol": "uL"}
+    csv1 = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/samples.csv").data.decode(
+        "utf-8-sig")
+    assert "saved-target" in csv1 and "ng/uL" in csv1 and "mg/L" not in csv1
+    fig1 = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/figure.png")
+    meta1 = Image.open(io.BytesIO(fig1.data)).text
+    assert meta1.get("target") == "saved-target" and meta1.get("stale") == "1"
+    # 以新输入成线 v2:不过期,导出标签为新浓度(其余元数据此时还未改)
+    r = c.post(f"/api/calibrations/{fp_cal}/fit", json=changed).get_json()
+    v2_id = r["version_id"]
+    st = c.get(f"/api/calibrations/{fp_cal}").get_json()
+    assert not next(v for v in st["versions"] if v["id"] == v2_id)["stale"]
+    assert next(v for v in st["versions"] if v["id"] == v1_id)["stale"]
+    j2 = c.get(f"/api/calibrations/{fp_cal}/versions/{v2_id}/model.json").get_json()
+    assert not j2["stale"]
+    assert next(p for p in j2["snapshot"]["points"]
+                if p["lane_label"] == "L1")["concentration"] == 1.25
+    print("8-fp1. 标准浓度变化 -> 旧版过期;新成线版本不过期;导出读各自快照 ✔")
+
+    # 8-fp2. 回归:改目标成分与单位(校准元数据)即过期;旧版 CSV/JSON/图统一保留旧标签
+    c.post(f"/api/calibrations/{fp_cal}/update", json={
+        "target_name": "current-target", "conc_unit": "mg/L", "vol_unit": "mL"})
+    st = c.get(f"/api/calibrations/{fp_cal}").get_json()
+    assert all(v["stale"] for v in st["versions"]), "元数据变化后旧版都应过期"
+    j1b = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/model.json").get_json()
+    assert j1b["stale"] and j1b["snapshot"]["target"]["name"] == "saved-target"
+    assert j1b["snapshot"]["units"] == {"conc": "ng/uL", "vol": "uL"}
+    csv1b = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/samples.csv").data.decode(
+        "utf-8-sig")
+    assert "saved-target" in csv1b and "ng/uL" in csv1b
+    assert "current-target" not in csv1b and "mg/L" not in csv1b
+    fig1b = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/figure.png")
+    meta1b = Image.open(io.BytesIO(fig1b.data)).text
+    assert meta1b.get("target") == "saved-target"
+    assert meta1b.get("conc_unit") == "ng/uL" and meta1b.get("vol_unit") == "uL"
+    assert meta1b.get("stale") == "1"
+    # 用当前(新)元数据再成线 v3:标签为新值且不过期;旧版仍保留旧标签
+    cur_payload = cal_payload(lanes_fp, overrides={0: {"concentration": 1.25}})
+    r = c.post(f"/api/calibrations/{fp_cal}/fit", json=cur_payload).get_json()
+    v3_id = r["version_id"]
+    j3 = c.get(f"/api/calibrations/{fp_cal}/versions/{v3_id}/model.json").get_json()
+    assert not j3["stale"] and j3["snapshot"]["target"]["name"] == "current-target"
+    assert j3["snapshot"]["units"] == {"conc": "mg/L", "vol": "mL"}
+    csv3 = c.get(f"/api/calibrations/{fp_cal}/versions/{v3_id}/samples.csv").data.decode(
+        "utf-8-sig")
+    assert "current-target" in csv3 and "mg/L" in csv3
+    fig3 = c.get(f"/api/calibrations/{fp_cal}/versions/{v3_id}/figure.png")
+    meta3 = Image.open(io.BytesIO(fig3.data)).text
+    assert meta3.get("target") == "current-target"
+    assert meta3.get("conc_unit") == "mg/L" and meta3.get("vol_unit") == "mL"
+    assert meta3.get("stale") == "0"
+    assert b"EXPIRED" not in fig3.headers.get("Content-Disposition", "").encode()
+    j1c = c.get(f"/api/calibrations/{fp_cal}/versions/{v1_id}/model.json").get_json()
+    assert j1c["snapshot"]["target"]["name"] == "saved-target"
+    print("8-fp2. 目标/单位变化 -> 旧版过期且三类导出统一保留保存时标签 ✔")
 
     # 9. 几何重设 -> 泳道全部消失:旧标注成为 orphan,不参与评估但仍可查看/清理
     moved_corners = [[5, 5], [W - 6, 5], [W - 6, H - 6], [5, H - 6]]

@@ -1062,6 +1062,29 @@ def create_app(data_dir=None):
         cal_cache[aid] = {"fp": fp, "data": data}
         return data
 
+    def cal_source_fingerprint(data, cal, rows):
+        """校准来源指纹:板指纹(几何/泳道/峰边界)+ 影响拟合、反算与标签的全部输入。
+
+        含校准元数据(名称/目标/参考 Rf/容差/单位)与每条泳道标注(角色/绑定斑点/
+        浓度/进样体积/稀释/排除及理由)。任一变化 => 已成线版本过期。
+        模型种类不参与:每版模型在快照中各自固定 model,切换模型不使旧模型失效。
+        """
+        payload = {
+            "plate_fp": data["fingerprint"] if data else "",
+            "image_sha1": (data["analysis"]["image_sha1"] if data else ""),
+            "cfg": {"name": cal["name"], "target_name": cal["target_name"],
+                    "target_rf": cal["target_rf"], "rf_tol": cal["rf_tol"],
+                    "conc_unit": cal["conc_unit"], "vol_unit": cal["vol_unit"]},
+            "lanes": [
+                {"lane_id": r["lane_id"], "role": r["role"], "peak_id": r["peak_id"],
+                 "concentration": r["concentration"], "volume": r["volume"],
+                 "dilution": r["dilution"], "excluded": r["excluded"],
+                 "exclude_reason": r["exclude_reason"]}
+                for r in sorted(rows, key=lambda r: r["lane_id"])],
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
     def _spot_brief(s):
         return {"peak_id": s["peak_id"], "spot_no": s.get("spot_no"), "rf": s["rf"],
                 "area": s["area"], "center_y": s["center_y"], "y0": s["y0"], "y1": s["y1"],
@@ -1147,6 +1170,7 @@ def create_app(data_dir=None):
 
         if not bundle:
             out["no_geometry"] = True
+            out["source_fingerprint"] = cal_source_fingerprint(data, cal, rows)
             return out
         spots_by_lane = {}
         lane_by_id = {}
@@ -1183,9 +1207,13 @@ def create_app(data_dir=None):
                 "annotation": entries[lid], "orphan": True})
         out["missing_lanes"] = missing
 
-        # 历史版本(含过期判定)
+        # 当前来源指纹(板几何/边界 + 校准元数据 + 泳道标注)
+        source_fp = cal_source_fingerprint(data, cal, rows)
+        out["source_fingerprint"] = source_fp
+
+        # 历史版本(含过期判定):来源指纹任一变化即过期
         for v in db.list_cal_versions(c, cal_id):
-            v["stale"] = v["source_fp"] != data["fingerprint"]
+            v["stale"] = v["source_fp"] != source_fp
             snap = None
             if v["id"] == cal["current_version"]:
                 snap_row = db.get_cal_version(c, v["id"])
@@ -1360,6 +1388,7 @@ def create_app(data_dir=None):
             "tool": TOOL, "tool_version": __version__,
             "saved_at": db.now(),
             "analysis_id": cal["analysis_id"],
+            "calibration_name": cal["name"],
             "analysis_name": data["analysis"]["name"],
             "image_sha1": data["analysis"]["image_sha1"],
             "geometry_version": bundle["geometry_version"],
@@ -1415,9 +1444,12 @@ def create_app(data_dir=None):
                       ";".join(i["message"] for i in ev["issues"]
                                if i["level"] == "error" and i["type"] in calibration.BLOCKERS))
             data = cal_plate_data(c, cal["analysis_id"])
-            snap = _build_snapshot(db.get_calibration(c, cal_id), data, ev)
+            cal = db.get_calibration(c, cal_id)   # 取含 model 更新后的元数据
+            rows = db.list_cal_lanes(c, cal_id)
+            source_fp = cal_source_fingerprint(data, cal, rows)
+            snap = _build_snapshot(cal, data, ev)
             vid, ver = db.add_cal_version(c, cal_id, model, ev["fit"], snap,
-                                          data["fingerprint"])
+                                          source_fp)
             return jsonify({"version_id": vid, "version": ver,
                             "state": calibration_state(c, cal_id)})
 
@@ -1430,13 +1462,15 @@ def create_app(data_dir=None):
             v = db.get_cal_version(c, vid)
             if not v or v["calibration_id"] != cal_id:
                 abort(404, "版本不存在")
-            data = cal_plate_data(c, cal["analysis_id"])
+            cur_fp = cal_source_fingerprint(
+                cal_plate_data(c, cal["analysis_id"]), cal,
+                db.list_cal_lanes(c, cal_id))
             return jsonify({"version": {k: v[k] for k in
                                         ("id", "version", "model", "fit", "source_fp",
                                          "is_current", "created_at")},
                             "snapshot": v["snapshot"],
-                            "stale": v["source_fp"] != data["fingerprint"],
-                            "current_fp": data["fingerprint"]})
+                            "stale": v["source_fp"] != cur_fp,
+                            "current_fp": cur_fp})
 
     @app.post("/api/calibrations/<int:cal_id>/delete")
     def delete_calibration(cal_id):
@@ -1450,21 +1484,32 @@ def create_app(data_dir=None):
                             "calibrations": db.list_calibrations(c, aid)})
 
     def _version_or_400(c, cal_id, vid):
+        """取版本与成线时快照;stale 按“板+校准元数据+标注”联合来源指纹判定。
+
+        返回 (cal_row, version_row, snap, stale)。所有导出标签一律取 snap,
+        保证过期版本导出与其保存时输入一致,不被当前元数据污染。
+        """
         cal = db.get_calibration(c, cal_id)
         if not cal:
             abort(404, "校准不存在")
         v = db.get_cal_version(c, vid)
         if not v or v["calibration_id"] != cal_id:
             abort(404, "版本不存在")
-        data = cal_plate_data(c, cal["analysis_id"])
-        stale = v["source_fp"] != data["fingerprint"]
-        return cal, v, v["snapshot"], stale
+        cur_fp = cal_source_fingerprint(
+            cal_plate_data(c, cal["analysis_id"]), cal,
+            db.list_cal_lanes(c, cal_id))
+        stale = v["source_fp"] != cur_fp
+        return cal, v, v["snapshot"], stale, cur_fp
 
     @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/samples.csv")
     def export_cal_samples_csv(cal_id, vid):
         with con() as c:
-            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
-            fit = v["fit"]
+            cal, v, snap, stale, _ = _version_or_400(c, cal_id, vid)
+            # 标签/单位/目标全部读保存时快照;旧快照缺 calibration_name 时回退行名
+            cal_name = snap.get("calibration_name") or cal["name"]
+            target = snap.get("target", {})
+            units = snap.get("units", {})
+            conc_unit = units.get("conc", "")
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(["calibration_id", "calibration_name", "version", "model",
@@ -1475,9 +1520,9 @@ def create_app(data_dir=None):
                         "conc_unit", "in_range", "status", "reasons"])
             for s in snap["samples"]:
                 w.writerow([
-                    cal_id, cal["name"], v["version"], v["model"],
+                    cal_id, cal_name, v["version"], v["model"],
                     1 if stale else 0, cal["analysis_id"], snap["analysis_name"],
-                    snap["geometry_version"], cal["target_name"],
+                    snap["geometry_version"], target.get("name", ""),
                     s["lane_id"], s["lane_label"], s.get("spot_no", ""),
                     s.get("peak_id", ""),
                     "" if s.get("rf") is None else f"{s['rf']:.4f}",
@@ -1488,7 +1533,7 @@ def create_app(data_dir=None):
                     else f"{s['applied_concentration']:.6g}",
                     "" if s.get("sample_concentration") is None
                     else f"{s['sample_concentration']:.6g}",
-                    cal["conc_unit"],
+                    conc_unit,
                     "" if s.get("in_range") is None else (1 if s["in_range"] else 0),
                     s["status"], ";".join(s.get("reasons", []))])
             mem = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
@@ -1500,15 +1545,17 @@ def create_app(data_dir=None):
     @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/model.json")
     def export_cal_model_json(cal_id, vid):
         with con() as c:
-            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
+            cal, v, snap, stale, cur_fp = _version_or_400(c, cal_id, vid)
+            cal_name = snap.get("calibration_name") or cal["name"]
             payload = {
                 "tool": TOOL, "tool_version": __version__,
                 "exported_at": db.now(),
-                "calibration_id": cal_id, "name": cal["name"],
+                "calibration_id": cal_id, "name": cal_name,
                 "analysis_id": cal["analysis_id"],
                 "version": v["version"], "version_id": v["id"],
                 "model": v["model"], "fit": v["fit"],
-                "source_fingerprint": v["source_fp"], "stale": stale,
+                "source_fingerprint": v["source_fp"],
+                "current_fingerprint": cur_fp, "stale": stale,
                 "snapshot": snap}
             mem = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
             mem.seek(0)
@@ -1519,22 +1566,42 @@ def create_app(data_dir=None):
     @app.get("/api/calibrations/<int:cal_id>/versions/<int:vid>/figure.png")
     def export_cal_figure(cal_id, vid):
         with con() as c:
-            cal, v, snap, stale = _version_or_400(c, cal_id, vid)
+            cal, v, snap, stale, _ = _version_or_400(c, cal_id, vid)
             ev = {
                 "model": v["model"], "fit": v["fit"], "range": snap["range"],
                 "points": snap["points"], "excluded_points": snap["excluded_points"],
                 "samples": snap["samples"], "issues": snap["issues"],
                 "blocked": snap["blocked"], "blocker_types": snap["blocker_types"]}
-            meta = {"calibration_name": cal["name"], "analysis_id": cal["analysis_id"],
+            units = snap.get("units", {})
+            target = snap.get("target", {})
+            meta = {"calibration_name": snap.get("calibration_name") or cal["name"],
+                    "analysis_id": cal["analysis_id"],
                     "analysis_name": snap["analysis_name"], "version": v["version"],
-                    "target_name": cal["target_name"], "conc_unit": cal["conc_unit"],
-                    "vol_unit": cal["vol_unit"], "created_at": v["created_at"]}
+                    "target_name": target.get("name", ""),
+                    "conc_unit": units.get("conc", ""),
+                    "vol_unit": units.get("vol", ""),
+                    "created_at": v["created_at"]}
             img = calibration.draw_calibration(ev, meta, stale=stale)
+            # 来源元数据写入 PNG 文本块,便于核对图像来自哪一版快照
+            from PIL import PngImagePlugin
+            info = PngImagePlugin.PngInfo()
+            for k, val in (("calibration_id", str(cal_id)),
+                           ("version", str(v["version"])),
+                           ("model", v["model"]),
+                           ("target", target.get("name", "")),
+                           ("source_fingerprint", v["source_fp"]),
+                           ("stale", "1" if stale else "0"),
+                           ("calibration_name", snap.get("calibration_name") or cal["name"]),
+                           ("conc_unit", units.get("conc", "")),
+                           ("vol_unit", units.get("vol", ""))):
+                info.add_text(k, val.encode("ascii", "replace").decode())
             path = os.path.join(exports, f"cal{cal_id}_v{v['version']}_calibration.png")
-            img.save(path)
+            img.save(path, pnginfo=info)
+            tag = "_EXPIRED" if stale else ""
             return send_file(path, mimetype="image/png",
                              as_attachment=request.args.get("dl") == "1",
-                             download_name=os.path.basename(path))
+                             download_name=os.path.basename(path).replace(
+                                 ".png", f"{tag}.png"))
 
     return app
 
